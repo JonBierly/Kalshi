@@ -1,0 +1,60 @@
+NBA Model Analysis Summary
+================================================================================
+
+Models: 5 in ensemble
+Features: 39
+Training samples: 425208
+Analysis sample: 5000
+
+Top 15 Most Important Features (Native):
+--------------------------------------------------------------------------------
+ 1. score_diff                               0.1544 ± 0.0068
+ 7. required_catchup_rate                    0.0775 ± 0.0025
+13. home_team_recent_win_pct                 0.0442 ± 0.0034
+19. away_team_recent_off_rtg                 0.0348 ± 0.0015
+37. away_roster_recent_est_def_rating        0.0323 ± 0.0021
+38. away_roster_recent_pie                   0.0321 ± 0.0050
+28. home_roster_recent_est_off_rating        0.0303 ± 0.0039
+26. home_roster_season_pie                   0.0300 ± 0.0030
+29. home_roster_recent_est_def_rating        0.0293 ± 0.0040
+39. away_roster_recent_est_usg_pct           0.0289 ± 0.0042
+34. away_roster_season_pie                   0.0277 ± 0.0032
+18. away_team_season_win_pct                 0.0275 ± 0.0038
+32. away_roster_season_est_off_rating        0.0270 ± 0.0015
+20. away_team_recent_def_rtg                 0.0269 ± 0.0020
+ 9. home_team_season_def_rtg                 0.0258 ± 0.0007
+
+
+Top 15 Most Important Features (Permutation):
+--------------------------------------------------------------------------------
+ 1. score_diff                               0.0919 ± 0.0040
+28. home_roster_recent_est_off_rating        0.0312 ± 0.0048
+37. away_roster_recent_est_def_rating        0.0193 ± 0.0064
+36. away_roster_recent_est_off_rating        0.0128 ± 0.0037
+39. away_roster_recent_est_usg_pct           0.0117 ± 0.0033
+ 7. required_catchup_rate                    0.0108 ± 0.0009
+19. away_team_recent_off_rtg                 0.0083 ± 0.0059
+38. away_roster_recent_pie                   0.0071 ± 0.0008
+27. home_roster_season_est_usg_pct           0.0069 ± 0.0014
+ 8. home_team_season_off_rtg                 0.0060 ± 0.0022
+26. home_roster_season_pie                   0.0059 ± 0.0031
+32. away_roster_season_est_off_rating        0.0058 ± 0.0012
+35. away_roster_season_est_usg_pct           0.0049 ± 0.0011
+18. away_team_season_win_pct                 0.0046 ± 0.0018
+34. away_roster_season_pie                   0.0038 ± 0.0022
+
+
+Highly Correlated Features (|r| > 0.95):
+--------------------------------------------------------------------------------
+  home_team_season_off_rtg <-> home_team_recent_off_rtg: 0.995
+  home_team_season_def_rtg <-> home_team_recent_def_rtg: 0.996
+  away_team_season_off_rtg <-> away_team_recent_off_rtg: 0.995
+  away_team_season_def_rtg <-> away_team_recent_def_rtg: 0.995
+  home_roster_season_est_off_rating <-> home_roster_recent_est_off_rating: 0.989
+  home_roster_season_est_def_rating <-> home_roster_recent_est_def_rating: 0.992
+  home_roster_season_pie <-> home_roster_recent_pie: 0.975
+  home_roster_season_est_usg_pct <-> home_roster_recent_est_usg_pct: 0.992
+  away_roster_season_est_off_rating <-> away_roster_recent_est_off_rating: 0.990
+  away_roster_season_est_def_rating <-> away_roster_recent_est_def_rating: 0.992
+  away_roster_season_pie <-> away_roster_recent_pie: 0.972
+  away_roster_season_est_usg_pct <-> away_roster_recent_est_usg_pct: 0.991

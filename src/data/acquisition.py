@@ -292,5 +292,5 @@ class LiveClient:
             box = boxscore.BoxScore(game_id=game_id)
             return box.game.get_dict()
         except Exception as e:
-            print(f"Error fetching live boxscore for {game_id}: {e}")
+            # Silently return empty dict for games that haven't started yet
             return {}

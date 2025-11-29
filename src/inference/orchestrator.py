@@ -7,12 +7,20 @@ from src.features.engineering import TeamStatsEngine, RosterEngine, FeatureEngin
 from src.models.prediction import PredictionEngine
 
 class LiveGameOrchestrator:
-    def __init__(self, client=None):
+    def __init__(self, client=None, model_type='lr'):
+        """
+        Initialize live game orchestrator.
+        
+        Args:
+            client: Optional LiveClient instance
+            model_type: 'lr' or 'xgboost' for model selection (default: 'lr')
+        """
         self.live_client = client if client else LiveClient()
         self.team_engine = TeamStatsEngine()
         self.roster_engine = RosterEngine()
-        self.prediction_engine = PredictionEngine()
+        self.prediction_engine = PredictionEngine(model_type=model_type)
         self.feature_engine = FeatureEngine()
+
         
     def get_todays_games(self):
         """Fetches today's games and returns a list of game info."""

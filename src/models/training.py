@@ -6,6 +6,8 @@ from sklearn.model_selection import train_test_split
 import xgboost as xgb
 from src.data.database import DatabaseManager
 from src.features.engineering import create_live_features, add_advanced_features, BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from sklearn.metrics import roc_auc_score
+from sklearn.model_selection import train_test_split
 
 def prepare_training_data(num_games=None):
     """Generates a dataset using the Database and labels it."""
@@ -62,7 +64,17 @@ def prepare_training_data(num_games=None):
 
 from src.models.experiment import ExperimentLogger
 
-def train_models():
+def train_models(models_to_train=['lr', 'xgboost']):
+    """
+    Train NBA prediction models.
+    
+    Args:
+        models_to_train: List of models to train. Options: 'lr', 'xgboost'
+                        Default: ['lr', 'xgboost'] (train both)
+    
+    Returns:
+        dict: Trained models {'lr': model, 'xgboost': ensemble_models}
+    """
     # 1. Prepare Data
     X, y = prepare_training_data()
     
@@ -91,77 +103,176 @@ def train_models():
     X_test = X_test[available_cols]
     
     print(f"Using {len(available_cols)} features.")
+    print(f"Models to train: {', '.join(models_to_train)}\n")
     
-    # 2. Logistic Regression Baseline
-    print("\nTraining Logistic Regression...")
-    lr_model = LogisticRegression(max_iter=5000)
-    lr_model.fit(X_train, y_train)
+    trained_models = {}
     
-    import time
-    start_time = time.time()
-    lr_probs = lr_model.predict_proba(X_test)[:, 1]
-    latency_ms = (time.time() - start_time) * 1000 / len(X_test)
-    
-    lr_loss = log_loss(y_test, lr_probs)
-    lr_acc = accuracy_score(y_test, lr_probs > 0.5)
-    
-    print(f"Logistic Regression - Log Loss: {lr_loss:.4f}, Accuracy: {lr_acc:.4f}, Latency: {latency_ms:.4f} ms/row")
-    
-    logger.log_experiment(
-        model_type='LogisticRegression',
-        features=available_cols,
-        hyperparams={'max_iter': 5000},
-        metrics={'accuracy': lr_acc, 'log_loss': lr_loss, 'latency_ms': latency_ms},
-        notes='Advanced features-all games'
-    )
-    
-    # 3. XGBoost Ensemble
-    print("\nTraining XGBoost Ensemble...")
-    ensemble_models = []
-    n_models = 5
-    
-    for i in range(n_models):
-        indices = np.random.choice(len(X_train), len(X_train), replace=True)
-        X_boot = X_train.iloc[indices]
-        y_boot = y_train[indices]
+    # =========================================================================
+    # 2. Logistic Regression
+    # =========================================================================
+    if 'lr' in models_to_train:
+        print("=" * 80)
+        print("Training Logistic Regression...")
+        print("=" * 80)
         
-        model = xgb.XGBClassifier(
-            n_estimators=300,
-            learning_rate=0.1,
-            max_depth=5,
-            objective='binary:logistic',
-            eval_metric='logloss',
-            use_label_encoder=False,
-            random_state=i
+        lr_model = LogisticRegression(
+            max_iter=3000,
+            solver='saga',      # Better for large datasets
+            n_jobs=-1          # Parallel processing
         )
-        model.fit(X_boot, y_boot)
-        ensemble_models.append(model)
+
+        lr_model.fit(X_train, y_train)
+        
+        import time
+        start_time = time.time()
+        lr_probs = lr_model.predict_proba(X_test)[:, 1]
+        latency_ms = (time.time() - start_time) * 1000 / len(X_test)
+        
+        lr_loss = log_loss(y_test, lr_probs)
+        lr_acc = accuracy_score(y_test, lr_probs > 0.5)
+        lr_auc = roc_auc_score(y_test, lr_probs)
+        
+        print(f"Log Loss: {lr_loss:.4f}")
+        print(f"Accuracy: {lr_acc:.4f}")
+        print(f"AUC: {lr_auc:.4f}")
+        print(f"Latency: {latency_ms:.4f} ms/row")
+        
+        logger.log_experiment(
+            model_type='LogisticRegression',
+            features=available_cols,
+            hyperparams={'max_iter': 3000, 'solver': 'saga'},
+            metrics={'accuracy': lr_acc, 'log_loss': lr_loss, 'auc': lr_auc, 'latency_ms': latency_ms},
+            notes='Production model - recent features only'
+        )
+        
+        # Save LR model
+        import joblib
+        lr_path = 'models/nba_lr_model.pkl'
+        joblib.dump(lr_model, lr_path)
+        print(f"✓ Saved to '{lr_path}'\n")
+        
+        trained_models['lr'] = lr_model
+        trained_models['lr_probs'] = lr_probs
     
-    # Evaluate
-    start_time = time.time()
-    ensemble_preds = np.array([m.predict_proba(X_test)[:, 1] for m in ensemble_models])
-    mean_preds = np.mean(ensemble_preds, axis=0)
-    latency_ms = (time.time() - start_time) * 1000 / len(X_test)
+    # =========================================================================
+    # 3. XGBoost Ensemble
+    # =========================================================================
+    if 'xgboost' in models_to_train:
+        print("=" * 80)
+        print("Training XGBoost Ensemble with Early Stopping...")
+        print("=" * 80)
+        
+        ensemble_models = []
+        n_models = 5
+        
+        for i in range(n_models):
+            print(f"  Training model {i+1}/{n_models}...", end=' ')
+            
+            # Bootstrap sampling
+            indices = np.random.choice(len(X_train), len(X_train), replace=True)
+            X_boot = X_train.iloc[indices]
+            y_boot = y_train[indices]
+            
+            # Split bootstrap sample into train/validation for early stopping
+            X_tr, X_val, y_tr, y_val = train_test_split(
+                X_boot, y_boot, test_size=0.2, random_state=i
+            )
+            
+            model = xgb.XGBClassifier(
+                n_estimators=1000,         # More trees, early stopping will cut off
+                learning_rate=0.03,        # Much lower
+                max_depth=3,               # Slightly shallower
+                min_child_weight=3,        # More conservative splits
+                subsample=0.8,             # Row sampling (regularization)
+                colsample_bytree=0.8,      # Column sampling (regularization)
+                gamma=0.1,                 # Min loss reduction for split
+                reg_alpha=0.1,             # L1 regularization
+                reg_lambda=1.0,            # L2 regularization
+                objective='binary:logistic',
+                eval_metric='logloss',
+                early_stopping_rounds=50,  # Early stopping in constructor (new XGBoost)
+                random_state=i
+            )
+            
+            # Fit with early stopping
+            model.fit(
+                X_tr, y_tr,
+                eval_set=[(X_val, y_val)],
+                verbose=False
+            )
+            
+            ensemble_models.append(model)
+            print(f"Best iteration: {model.best_iteration}")
+        
+        print(f"\nTrained {len(ensemble_models)} models in ensemble")
+        
+        # Evaluate
+        import time
+        start_time = time.time()
+        ensemble_preds = np.array([m.predict_proba(X_test)[:, 1] for m in ensemble_models])
+        mean_preds = np.mean(ensemble_preds, axis=0)
+        latency_ms = (time.time() - start_time) * 1000 / len(X_test)
+        
+        ensemble_loss = log_loss(y_test, mean_preds)
+        ensemble_acc = accuracy_score(y_test, mean_preds > 0.5)
+        xgb_auc = roc_auc_score(y_test, mean_preds)
+        
+        print(f"\nEnsemble Performance:")
+        print(f"Log Loss: {ensemble_loss:.4f}")
+        print(f"Accuracy: {ensemble_acc:.4f}")
+        print(f"AUC: {xgb_auc:.4f}")
+        print(f"Latency: {latency_ms:.4f} ms/row")
+        
+        logger.log_experiment(
+            model_type='XGBoostEnsemble',
+            features=available_cols,
+            hyperparams={
+                'n_estimators': 1000, 
+                'learning_rate': 0.03, 
+                'max_depth': 3, 
+                'n_models': 5,
+                'early_stopping_rounds': 50,
+                'min_child_weight': 3,
+                'subsample': 0.8,
+                'colsample_bytree': 0.8
+            },
+            metrics={'accuracy': ensemble_acc, 'log_loss': ensemble_loss, 'auc': xgb_auc, 'latency_ms': latency_ms},
+            notes='Early stopping with validation, reduced features (no season stats)'
+        )
+        
+        # Save XGBoost ensemble
+        import joblib
+        xgb_path = 'models/nba_xgboost_ensemble.pkl'
+        joblib.dump(ensemble_models, xgb_path)
+        print(f"✓ Saved to '{xgb_path}'\n")
+        
+        trained_models['xgboost'] = ensemble_models
+        trained_models['xgb_probs'] = mean_preds
     
-    ensemble_loss = log_loss(y_test, mean_preds)
-    ensemble_acc = accuracy_score(y_test, mean_preds > 0.5)
+    # =========================================================================
+    # Comparison (if both models trained)
+    # =========================================================================
+    if 'lr' in trained_models and 'xgboost' in trained_models:
+        print("=" * 80)
+        print("Model Comparison")
+        print("=" * 80)
+        
+        lr_probs = trained_models['lr_probs']
+        xgb_probs = trained_models['xgb_probs']
+        
+        lr_auc = roc_auc_score(y_test, lr_probs)
+        xgb_auc = roc_auc_score(y_test, xgb_probs)
+        
+        print(f"\nLR AUC: {lr_auc:.4f}")
+        print(f"XGBoost AUC: {xgb_auc:.4f}")
+        
+        # Check if predictions are similar
+        correlation = np.corrcoef(lr_probs, xgb_probs)[0, 1]
+        print(f"Prediction correlation: {correlation:.4f}")
+        
+        print("\n" + "=" * 80)
     
-    print(f"Ensemble (5 models) - Log Loss: {ensemble_loss:.4f}, Accuracy: {ensemble_acc:.4f}, Latency: {latency_ms:.4f} ms/row")
-    
-    logger.log_experiment(
-        model_type='XGBoostEnsemble',
-        features=available_cols,
-        hyperparams={'n_estimators': 300, 'learning_rate': 0.1, 'max_depth': 5, 'n_models': 5},
-        metrics={'accuracy': ensemble_acc, 'log_loss': ensemble_loss, 'latency_ms': latency_ms},
-        notes='Advanced features-all games'
-    )
-    
-    # Save models
-    import joblib
-    joblib.dump(ensemble_models, 'models/nba_live_model_ensemble.pkl')
-    print("Ensemble saved to 'models/nba_live_model_ensemble.pkl'")
-    
-    return lr_model, ensemble_models
+    return {k: v for k, v in trained_models.items() if k in ['lr', 'xgboost']}
 
 if __name__ == "__main__":
-    train_models()
+    train_models(models_to_train=['lr', 'xgboost'])

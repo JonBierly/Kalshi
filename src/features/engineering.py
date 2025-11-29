@@ -559,17 +559,21 @@ def add_advanced_features(pbp_df: pd.DataFrame) -> pd.DataFrame:
     
     return merged_df
 
+# Advanced features - using only recent stats (removed season stats due to high correlation)
 ADVANCED_FEATURES_LIST = [
-    'home_team_season_off_rtg', 'home_team_season_def_rtg', 'home_team_season_win_pct',
+    # Team recent performance (last 10 games)
     'home_team_recent_off_rtg', 'home_team_recent_def_rtg', 'home_team_recent_win_pct',
-    'home_rest_days', 'home_is_home',
-    'away_team_season_off_rtg', 'away_team_season_def_rtg', 'away_team_season_win_pct',
     'away_team_recent_off_rtg', 'away_team_recent_def_rtg', 'away_team_recent_win_pct',
+    
+    # Rest and home court
+    'home_rest_days', 'home_is_home',
     'away_rest_days', 'away_is_home',
-    'home_roster_season_est_off_rating', 'home_roster_season_est_def_rating', 'home_roster_season_pie', 'home_roster_season_est_usg_pct',
-    'home_roster_recent_est_off_rating', 'home_roster_recent_est_def_rating', 'home_roster_recent_pie', 'home_roster_recent_est_usg_pct',
-    'away_roster_season_est_off_rating', 'away_roster_season_est_def_rating', 'away_roster_season_pie', 'away_roster_season_est_usg_pct',
-    'away_roster_recent_est_off_rating', 'away_roster_recent_est_def_rating', 'away_roster_recent_pie', 'away_roster_recent_est_usg_pct'
+    
+    # Roster recent performance (last 10 games)
+    'home_roster_recent_est_off_rating', 'home_roster_recent_est_def_rating', 
+    'home_roster_recent_pie', 'home_roster_recent_est_usg_pct',
+    'away_roster_recent_est_off_rating', 'away_roster_recent_est_def_rating', 
+    'away_roster_recent_pie', 'away_roster_recent_est_usg_pct'
 ]
 
 BASE_FEATURES_LIST = ['score_diff', 'seconds_remaining', 'home_efg', 'away_efg', 'turnover_diff', 'home_rebound_rate', 'required_catchup_rate']

@@ -1,0 +1,29 @@
+{
+  "balance": 100.88,
+  "positions": {},
+  "history": [
+    {
+      "game_id": "0022500077",
+      "ticker": "KXNBAGAME-25NOV28SACUTA-UTA",
+      "action": "SELL",
+      "contracts": 6,
+      "entry_price": 75,
+      "exit_price": 88,
+      "pnl": 0.7800000000000002,
+      "timestamp": "2025-11-28T23:21:58.995731",
+      "reason": "Edge +1.8% too low: Sell 6 to reach 0"
+    },
+    {
+      "game_id": "0022500077",
+      "ticker": "KXNBAGAME-25NOV28SACUTA-UTA",
+      "action": "SELL",
+      "contracts": 5,
+      "entry_price": 89,
+      "exit_price": 91,
+      "pnl": 0.09999999999999964,
+      "timestamp": "2025-11-28T23:24:44.615785",
+      "reason": "Edge +2.0% too low: Sell 5 to reach 0"
+    }
+  ],
+  "last_updated": "2025-11-28T23:30:57.297158"
+}

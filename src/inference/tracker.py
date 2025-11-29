@@ -7,14 +7,23 @@ from src.data.database import DatabaseManager, OddsHistory
 from sqlalchemy.orm import sessionmaker
 
 class OddsTracker:
-    def __init__(self, kalshi_key_id, kalshi_key_path='key.key'):
+    def __init__(self, kalshi_key_id, kalshi_key_path='key.key', model_type='lr'):
+        """
+        Initialize odds tracker.
+        
+        Args:
+            kalshi_key_id: Kalshi API key ID
+            kalshi_key_path: Path to Kalshi API key file
+            model_type: 'lr' or 'xgboost' for model selection (default: 'lr')
+        """
         self.db = DatabaseManager()
         self.Session = sessionmaker(bind=self.db.engine)
         
-        self.orch = LiveGameOrchestrator()
+        self.orch = LiveGameOrchestrator(model_type=model_type)
         self.kalshi = KalshiClient(kalshi_key_id, kalshi_key_path)
         
         self.active_matches = [] # List of (game_info, kalshi_market_ticker)
+
         
     def setup(self):
         """Authenticates and matches games."""

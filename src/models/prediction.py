@@ -5,12 +5,37 @@ import time
 from src.features.engineering import FeatureEngine, TeamStatsEngine, RosterEngine, BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
 
 class PredictionEngine:
-    def __init__(self, model_path='models/nba_live_model_ensemble.pkl'):
-        print(f"Loading models from {model_path}...")
+    def __init__(self, model_type='lr', model_path=None):
+        """
+        Initialize prediction engine with specified model type.
+        
+        Args:
+            model_type: 'lr' for Logistic Regression or 'xgboost' for XGBoost ensemble
+            model_path: Optional custom path to model file. If None, uses default paths.
+        """
+        self.model_type = model_type
+        
+        # Determine model path
+        if model_path is None:
+            if model_type == 'lr':
+                model_path = 'models/nba_lr_model.pkl'
+            elif model_type == 'xgboost':
+                model_path = 'models/nba_xgboost_ensemble.pkl'
+            else:
+                raise ValueError(f"Invalid model_type: {model_type}. Must be 'lr' or 'xgboost'")
+        
+        print(f"Loading {model_type.upper()} model from {model_path}...")
         try:
             self.models = joblib.load(model_path)
+            
+            # For LR, convert single model to list for consistent interface
+            if model_type == 'lr' and not isinstance(self.models, list):
+                self.models = [self.models]
+                
+            n_models = len(self.models) if isinstance(self.models, list) else 1
+            print(f"  Loaded {n_models} model(s)")
         except FileNotFoundError:
-            print("Model file not found. Please run model_training.py first.")
+            print(f"Model file not found at {model_path}. Please train the model first.")
             self.models = []
             
         self.feature_engine = FeatureEngine()
@@ -61,17 +86,36 @@ class PredictionEngine:
         std_dev = np.std(preds)
         
         # Confidence Intervals
-        # 95% CI
-        ci_95_lower = np.percentile(preds, 2.5)
-        ci_95_upper = np.percentile(preds, 97.5)
-        
-        # 60% CI
-        ci_60_lower = np.percentile(preds, 20)
-        ci_60_upper = np.percentile(preds, 80)
-        
-        # 50% CI
-        ci_50_lower = np.percentile(preds, 25)
-        ci_50_upper = np.percentile(preds, 75)
+        if len(preds) > 1:
+            # Ensemble: Use percentiles from predictions
+            ci_95_lower = np.percentile(preds, 2.5)
+            ci_95_upper = np.percentile(preds, 97.5)
+            ci_60_lower = np.percentile(preds, 20)
+            ci_60_upper = np.percentile(preds, 80)
+            ci_50_lower = np.percentile(preds, 25)
+            ci_50_upper = np.percentile(preds, 75)
+        else:
+            # Single model (LR): Generate synthetic CIs based on uncertainty
+            # Predictions near 0.5 are more uncertain, near 0 or 1 are more certain
+            uncertainty = 1 - abs(mean_prob - 0.5) * 2  # 0 to 1, higher = more uncertain
+            
+            # Base width scales with uncertainty (reduced from 0.15 to 0.08 for narrower CIs)
+            base_width = 0.08 * uncertainty  # Max ±8% for most uncertain
+            
+            # 95% CI: Wider
+            ci_95_lower = max(0, mean_prob - base_width * 1.5)
+            ci_95_upper = min(1, mean_prob + base_width * 1.5)
+            
+            # 60% CI: Medium
+            ci_60_lower = max(0, mean_prob - base_width * 0.8)
+            ci_60_upper = min(1, mean_prob + base_width * 0.8)
+            
+            # 50% CI: Narrower
+            ci_50_lower = max(0, mean_prob - base_width * 0.5)
+            ci_50_upper = min(1, mean_prob + base_width * 0.5)
+            
+            # Estimate std_dev for consistency
+            std_dev = base_width / 2
         
         latency_ms = (time.time() - start_time) * 1000
         

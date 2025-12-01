@@ -2,7 +2,7 @@ from src.data.database import DatabaseManager, PlayerAdvancedStats, Game
 from src.data.acquisition import HistoricalDataClient
 import time
 
-def backfill_advanced_stats(season="2024-25", limit=None):
+def backfill_advanced_stats(season="2025-26", limit=None):
     """
     Iterates through games in DB and fetches advanced stats if missing.
     If season is provided, only checks games from that season.
@@ -56,4 +56,4 @@ def backfill_advanced_stats(season="2024-25", limit=None):
 
 if __name__ == "__main__":
     # Run for 2024-25 season
-    backfill_advanced_stats(season='2024-25', limit=None)
+    backfill_advanced_stats(season='2025-26', limit=None)

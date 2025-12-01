@@ -7,14 +7,19 @@ from src.data.database import DatabaseManager, OddsHistory
 from sqlalchemy.orm import sessionmaker
 
 class OddsTracker:
+    """
+    Tracks live NBA games and compares model predictions to Kalshi market odds.
+    Saves prediction history to database for analysis.
+    """
+    
     def __init__(self, kalshi_key_id, kalshi_key_path='key.key', model_type='lr'):
         """
-        Initialize odds tracker.
+        Initialize the odds tracker.
         
         Args:
             kalshi_key_id: Kalshi API key ID
-            kalshi_key_path: Path to Kalshi API key file
-            model_type: 'lr' or 'xgboost' for model selection (default: 'lr')
+            kalshi_key_path: Path to Kalshi API private key file
+            model_type: Model to use ('lr' or 'xgboost')
         """
         self.db = DatabaseManager()
         self.Session = sessionmaker(bind=self.db.engine)
@@ -22,34 +27,69 @@ class OddsTracker:
         self.orch = LiveGameOrchestrator(model_type=model_type)
         self.kalshi = KalshiClient(kalshi_key_id, kalshi_key_path)
         
-        self.active_matches = [] # List of (game_info, kalshi_market_ticker)
+        # Stores matched (NBA game, Kalshi market) pairs
+        self.active_matches = []
 
         
     def setup(self):
-        """Authenticates and matches games."""
-        # 1. Login to Kalshi
+        """Authenticate with Kalshi and match today's NBA games to Kalshi markets."""
+        # Authenticate with Kalshi API
         if not self.kalshi.login():
             raise Exception("Failed to login to Kalshi")
             
-        # 2. Get Today's NBA Games
+        # Get today's NBA games from NBA API
         nba_games = self.orch.get_todays_games()
         print(f"Found {len(nba_games)} NBA games today.")
         
-        # 3. Get Kalshi Markets
+        # Get active Kalshi NBA markets
         kalshi_events = self.kalshi.get_nba_markets()
         print(f"Found {len(kalshi_events)} active Kalshi NBA events.")
         
-        # 4. Match
+        # Match NBA games to Kalshi markets
         self.active_matches = self._match_markets(nba_games, kalshi_events)
         print(f"Matched {len(self.active_matches)} games to markets.")
         
     def _match_markets(self, nba_games, kalshi_events):
+        """
+        Match NBA games to Kalshi betting markets by team names and date.
+        
+        Strategy:
+        1. Generate today's date code (e.g., "25NOV30" for Nov 30, 2025)
+        2. Filter Kalshi events to only today's games
+        3. Normalize team city names (remove spaces, handle abbreviations)
+        4. Find Kalshi event containing both team cities in title
+        5. Extract home team tricode from event ticker (last 3 chars)
+        6. Find market ending with "-{HOME_TRICODE}" (this is the "home team wins" market)
+        
+        Args:
+            nba_games: List of NBA game dicts from NBA API
+            kalshi_events: List of Kalshi event dicts from Kalshi API
+            
+        Returns:
+            List of dicts with keys: 'nba_game', 'kalshi_ticker', 'kalshi_market'
+        """
         matches = []
         
-        # Helper to normalize names
+        # Generate today's date code in Kalshi format (e.g., "25NOV30")
+        today = datetime.now()
+        year_code = str(today.year)[-2:]  # Last 2 digits of year (e.g., "25")
+        month_code = today.strftime('%b').upper()  # 3-letter month (e.g., "NOV")
+        day_code = today.strftime('%d')  # 2-digit day (e.g., "30")
+        today_date_code = f"{year_code}{month_code}{day_code}"
+        
+        print(f"Filtering markets for today's date: {today_date_code}")
+        
+        # Filter events to only today's games
+        todays_events = [
+            event for event in kalshi_events 
+            if today_date_code in event.get('event_ticker', '')
+        ]
+        print(f"Found {len(todays_events)} events for today (filtered from {len(kalshi_events)} total)")
+        
         def normalize(name):
+            """Normalize team names for matching."""
             n = name.lower().replace(' ', '').replace('.', '').replace('76ers', 'sixers')
-            # Handle common abbreviations that might come from NBA API
+            # Handle city abbreviations
             mapping = {
                 'la': 'losangeles',
                 'ny': 'newyork',
@@ -60,85 +100,62 @@ class OddsTracker:
             return mapping.get(n, n)
             
         for game in nba_games:
-            # Kalshi uses City names (e.g. Detroit vs Indiana)
             home_team = game['homeTeam']['teamCity']
             away_team = game['awayTeam']['teamCity']
             
-            # Kalshi events usually have titles like "Detroit Pistons vs Indiana Pacers"
-            # We look for an event that contains BOTH team names
-            
+            # Find Kalshi event with both teams in title (from today's events only)
             matched_event = None
-            for event in kalshi_events:
+            for event in todays_events:
                 title = normalize(event.get('title', ''))
-                # Debug print for first game to see titles
-                if game == nba_games[0]:
-                    print(f"DEBUG: Comparing '{normalize(home_team)}' & '{normalize(away_team)}' vs '{title}'")
-                    
+                
                 if normalize(home_team) in title and normalize(away_team) in title:
                     matched_event = event
                     break
             
-            if matched_event:
-                # Found the event, now find the specific market for "Home Team Wins"
-                # Usually tickers are like 'NBA-DATE-AWAY-HOME' or similar.
-                # But we can just look at the markets inside the event if available, 
-                # or we might need to fetch markets for this event.
-                # The get_nba_markets call might return events without full market list.
-                # Let's assume we need to fetch markets for the event or infer ticker.
+            if not matched_event:
+                continue
                 
-                # Actually, let's try to find the market ticker from the event markets if present
-                # Or use the event ticker to find child markets.
-                # For simplicity, let's assume the event has a 'markets' field or we query it.
-                # Kalshi API structure: Event -> Markets.
-                # Let's try to fetch markets for this event ticker if we can't find them.
-                
-                # For now, let's print what we found and try to guess the ticker or fetch it.
-                # A common ticker format for "Winner" is the event ticker itself sometimes?
-                # No, markets have their own tickers.
-                # Let's assume we can get the market list.
-                
-                # If the event object has 'markets', use it.
-                markets = matched_event.get('markets', [])
-                
-                # If no markets in event, fetch them
-                if not markets:
-                    markets = self.kalshi.get_event_markets(matched_event['event_ticker'])
-                
-                # Debug: Print markets for the first matched event
-                # if markets:
-                #     print(f"DEBUG: Markets for {home_team} vs {away_team}: {[m.get('ticker') for m in markets]}")
-                
-                target_market = None
-                
-                # Strategy: Use the Event Ticker to determine the Home Team Suffix
-                # Event Ticker: KXNBAGAME-{DATE}{AWAY}{HOME}
-                # The last 3 characters should be the Home Team Tricode.
-                # We want the market that ends with this Tricode.
-                
-                event_ticker = matched_event['event_ticker']
-                home_tricode = event_ticker[-3:]
-                
-                for m in markets:
-                    if m['ticker'].endswith(f"-{home_tricode}"):
-                        target_market = m
-                        break
-                
-                if target_market:
-                    matches.append({
-                        'nba_game': game,
-                        'kalshi_ticker': target_market['ticker'],
-                        'kalshi_market': target_market
-                    })
-            #         print(f"Matched: {home_team} vs {away_team} -> {target_market['ticker']}")
-            #     else:
-            #         print(f"Event found for {home_team} vs {away_team} but no market ending in -{home_tricode} found.")
-            # else:
-            #     print(f"No Kalshi event found for {home_team} vs {away_team}")
+            # Get markets for this event (fetch if not included)
+            markets = matched_event.get('markets', [])
+            if not markets:
+                markets = self.kalshi.get_event_markets(matched_event['event_ticker'])
+            
+            # Extract home team tricode from event ticker
+            # Event ticker format: KXNBAGAME-{DATE}{AWAY}{HOME}
+            # Example: KXNBAGAME-25NOV30HOUUTA -> home tricode = UTA
+            event_ticker = matched_event['event_ticker']
+            home_tricode = event_ticker[-3:]
+            
+            # Find market for "home team wins" (ends with -{HOME_TRICODE})
+            target_market = None
+            for m in markets:
+                if m['ticker'].endswith(f"-{home_tricode}"):
+                    target_market = m
+                    break
+            
+            if target_market:
+                matches.append({
+                    'nba_game': game,
+                    'kalshi_ticker': target_market['ticker'],
+                    'kalshi_market': target_market
+                })
                 
         return matches
 
     def run_loop(self, interval=60):
-        """Main tracking loop."""
+        """
+        Main tracking loop - continuously updates predictions and logs to database.
+        
+        For each matched game:
+        1. Get live game data from NBA API
+        2. Calculate model prediction
+        3. Get current Kalshi market odds
+        4. Log both to database
+        5. Display comparison
+        
+        Args:
+            interval: Seconds between updates (default: 60)
+        """
         print("Starting tracking loop...")
         session = self.Session()
         
@@ -150,43 +167,41 @@ class OddsTracker:
                     game = match['nba_game']
                     ticker = match['kalshi_ticker']
                     
-                    # 1. Get Model Odds
-                    # We need to run the orchestrator's prediction logic for a single step
-                    # The orchestrator is designed for a loop, but we can extract the single step logic
-                    # or just instantiate the engine and update it.
-                    
-                    # Setup context if not already
+                    # Setup game context for model if needed
                     if self.orch.prediction_engine.current_game_id != game['gameId']:
-                        self.orch.setup_game_context(game['gameId'], game['homeTeam']['teamId'], game['awayTeam']['teamId'])
+                        self.orch.setup_game_context(
+                            game['gameId'], 
+                            game['homeTeam']['teamId'], 
+                            game['awayTeam']['teamId']
+                        )
                         self.orch.feature_engine.reset()
                         
-                    # Get Live Data
+                    # Get live game data
                     live_data = self.orch.live_client.get_live_game_data(game['gameId'])
                     if not live_data:
                         print(f"Skipping {game['gameCode']} (No live data)")
                         continue
                         
-                    # Update Feature Engine
+                    # Update feature engine with current game stats
                     home_stats = live_data['homeTeam']['statistics']
                     away_stats = live_data['awayTeam']['statistics']
                     
                     self.orch.feature_engine.home_stats = {
-                        'fgm': home_stats['fieldGoalsMade'], 'fga': home_stats['fieldGoalsAttempted'],
-                        'fg3m': home_stats['threePointersMade'], 'to': home_stats['turnovers'],
+                        'fgm': home_stats['fieldGoalsMade'], 
+                        'fga': home_stats['fieldGoalsAttempted'],
+                        'fg3m': home_stats['threePointersMade'], 
+                        'to': home_stats['turnovers'],
                         'reb': home_stats['reboundsTotal']
                     }
                     self.orch.feature_engine.away_stats = {
-                        'fgm': away_stats['fieldGoalsMade'], 'fga': away_stats['fieldGoalsAttempted'],
-                        'fg3m': away_stats['threePointersMade'], 'to': away_stats['turnovers'],
+                        'fgm': away_stats['fieldGoalsMade'], 
+                        'fga': away_stats['fieldGoalsAttempted'],
+                        'fg3m': away_stats['threePointersMade'], 
+                        'to': away_stats['turnovers'],
                         'reb': away_stats['reboundsTotal']
                     }
                     
-                    # Calc Features
-                    # (Simplified time parsing for now, assuming orchestrator logic is robust enough or we reuse it)
-                    # We'll just use the raw update logic from orchestrator if we can, but we can't call 'run_live_loop'.
-                    # We manually construct the features.
-                    
-                    # Time parsing
+                    # Parse game clock
                     remaining_time = 0
                     period = live_data['period']
                     if 'gameClock' in live_data:
@@ -195,74 +210,56 @@ class OddsTracker:
                             m, s = t_str.split(':')
                             remaining_time = int(m) * 60 + float(s)
                     
+                    # Calculate total seconds remaining (including future quarters)
                     total_seconds = remaining_time
                     if period <= 4:
                         total_seconds += (4 - period) * 720
                         
+                    # Build live features for model
                     live_features = {
                         'score_diff': live_data['homeTeam']['score'] - live_data['awayTeam']['score'],
                         'seconds_remaining': total_seconds,
                         'home_efg': self.orch.feature_engine._calc_efg(self.orch.feature_engine.home_stats),
                         'away_efg': self.orch.feature_engine._calc_efg(self.orch.feature_engine.away_stats),
                         'turnover_diff': self.orch.feature_engine.home_stats['to'] - self.orch.feature_engine.away_stats['to'],
-                        'home_rebound_rate': self.orch.feature_engine._calc_reb_rate(self.orch.feature_engine.home_stats['reb'], self.orch.feature_engine.away_stats['reb']),
+                        'home_rebound_rate': self.orch.feature_engine._calc_reb_rate(
+                            self.orch.feature_engine.home_stats['reb'], 
+                            self.orch.feature_engine.away_stats['reb']
+                        ),
                         'game_id': game['gameId'],
                         'home_team_id': game['homeTeam']['teamId'],
                         'away_team_id': game['awayTeam']['teamId']
                     }
                     
+                    # Combine with pre-game context (team stats, roster, etc.)
                     full_feats = {**live_features, **self.orch.prediction_engine.current_game_context}
                     
+                    # Get model prediction with confidence intervals
                     model_result = self.orch.prediction_engine.predict_with_confidence(full_feats)
                     model_prob = model_result['probability']
                     
-                    # 2. Get Kalshi Odds
-                    market_book = self.kalshi.get_orderbook(ticker)
+                    # Get Kalshi market prices
                     kalshi_prob = 0.0
                     yes_price = 0
                     no_price = 0
                     
-                    if market_book:
-                        # Use the best ask for "Yes" as the buy price (cost to bet on Home Win)
-                        # Or use the midpoint.
-                        # Kalshi prices are in cents (1-99).
-                        # Let's use the last traded price or the best bid/ask average.
-                        # For simplicity, let's check the 'yes' bids/asks.
-                        # Structure: {'yes': [[price, count], ...], 'no': ...}
-                        
-                        yes_bids = market_book.get('yes', [])
-                        yes_asks = market_book.get('yes', []) # Wait, usually separate
-                        
-                        # Actually, let's just use the 'get_market_details' for last price or current probability
-                        # But orderbook is better for live.
-                        # Let's try to get the best 'yes' ask (lowest price to buy 'yes')
-                        # If empty, no liquidity.
-                        
-                        best_ask = 0
-                        if yes_asks:
-                            # Sort by price ascending? usually API returns sorted?
-                            # Let's assume list of [price, qty].
-                            # We want lowest price.
-                            # Actually, let's just fetch market details for 'last_price' or 'yes_bid' / 'yes_ask'
-                            pass
-                            
-                        # Fallback to market details for simplicity
-                        details = self.kalshi.get_market_details(ticker)
-                        if details:
-                            yes_price = details.get('yes_ask', 0)
-                            no_price = details.get('no_ask', 0)
-                            # Implied prob is roughly price / 100
-                            kalshi_prob = yes_price / 100.0
+                    details = self.kalshi.get_market_details(ticker)
+                    if details:
+                        yes_price = details.get('yes_ask', 0)  # Price to buy "home wins"
+                        no_price = details.get('no_ask', 0)    # Price to buy "home loses"
+                        kalshi_prob = yes_price / 100.0        # Convert cents to probability
                     
-                    # Format time for display
+                    # Display comparison
                     clock_display = live_data.get('gameClock', '').replace('PT', '').replace('M', ':').replace('S', '')
+                    score_display = f"{live_data['homeTeam']['score']}-{live_data['awayTeam']['score']}"
                     
-                    print(f"{game['gameCode']}: {live_data['homeTeam']['score']}-{live_data['awayTeam']['score']} (Q{period} {clock_display}) | Model {model_prob:.1%} | Kalshi {kalshi_prob:.1%} (Ticker: {ticker})")
+                    print(f"{game['gameCode']}: {score_display} (Q{period} {clock_display}) | "
+                          f"Model {model_prob:.1%} | Kalshi {kalshi_prob:.1%} (Ticker: {ticker})")
                     print(f"   CI 50%: {model_result['ci_50_lower']:.1%}-{model_result['ci_50_upper']:.1%}")
                     print(f"   CI 60%: {model_result['ci_60_lower']:.1%}-{model_result['ci_60_upper']:.1%}")
                     print(f"   CI 95%: {model_result['ci_95_lower']:.1%}-{model_result['ci_95_upper']:.1%}")
                     
-                    # 3. Log to DB
+                    # Log to database
                     record = OddsHistory(
                         game_id=game['gameId'],
                         timestamp=datetime.utcnow(),

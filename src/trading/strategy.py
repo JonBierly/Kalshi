@@ -7,6 +7,7 @@ class TradeSignal:
     action: str  # 'BUY', 'SELL', 'HOLD'
     contracts: int
     price: float
+    side: str  # 'YES' or 'NO'
     reason: str
     edge: float
     target_contracts: int
@@ -61,39 +62,58 @@ class TradingStrategy:
         f = (b * p - q) / b
         return max(0.0, f)
 
-    def calculate_target_position(self, model_prob: float, market_price: float, bankroll: float) -> int:
+    def calculate_target_position(self, model_prob: float, market_price_yes: float, market_price_no: float, bankroll: float) -> Tuple[int, str]:
         """
-        Calculate ideal number of contracts to hold based on Kelly Criterion.
+        Calculate ideal number of contracts and side (YES/NO) based on Kelly Criterion.
         """
-        market_prob = market_price / 100.0
-        edge = model_prob - market_prob
+        # Calculate Edge for YES
+        market_prob_yes = market_price_yes / 100.0
+        edge_yes = model_prob - market_prob_yes
         
-        # 1. Check Edge
-        if edge < self.risk_manager.min_edge:
-            return 0
+        # Calculate Edge for NO
+        # Model prob for NO is 1 - model_prob
+        model_prob_no = 1.0 - model_prob
+        market_prob_no = market_price_no / 100.0
+        edge_no = model_prob_no - market_prob_no
+        
+        target_side = 'YES'
+        target_contracts = 0
+        
+        # Determine which side (if any) to bet on
+        if edge_yes > self.risk_manager.min_edge:
+            # Bet YES
+            target_side = 'YES'
+            raw_kelly = self.calculate_kelly_fraction(model_prob, market_prob_yes)
+            contract_price = market_prob_yes
             
-        # 2. Calculate Kelly
-        raw_kelly = self.calculate_kelly_fraction(model_prob, market_prob)
+        elif edge_no > self.risk_manager.min_edge:
+            # Bet NO
+            target_side = 'NO'
+            raw_kelly = self.calculate_kelly_fraction(model_prob_no, market_prob_no)
+            contract_price = market_prob_no
+            
+        else:
+            # No significant edge
+            return 0, 'YES'
+
+        # Apply Risk Management
         adj_kelly = raw_kelly * self.fractional_kelly
-        
-        # 3. Apply Max Position Limit
         target_allocation_pct = min(adj_kelly, self.risk_manager.max_position_pct)
         
-        # 4. Convert to Contracts
         target_capital = bankroll * target_allocation_pct
-        contract_price = market_price / 100.0
         
         if contract_price <= 0:
-            return 0
+            return 0, target_side
             
         target_contracts = int(target_capital / contract_price)
-        return target_contracts
+        return target_contracts, target_side
 
     def evaluate_market(
         self,
         game_id: str,
         model_result: Dict,
-        market_price: float,
+        market_price_yes: float,
+        market_price_no: float,
         bankroll: float,
         current_position: Optional[Position] = None
     ) -> TradeSignal:
@@ -101,42 +121,116 @@ class TradingStrategy:
         Evaluate market and generate BUY/SELL/HOLD signal to reach target position.
         """
         model_prob = model_result['probability']
-        market_prob = market_price / 100.0
-        edge = model_prob - market_prob
+        seconds_remaining = model_result.get('seconds_remaining', 0)
+        score_diff = model_result.get('score_diff', 0)
+        
+        # 1. HARD CUTOFF: Close all positions when < 2 minutes (120s) remain
+        # Markets are too volatile and data latency is too high to trade safely
+        if seconds_remaining < 120:
+            current_contracts = current_position.contracts if current_position else 0
+            current_side = current_position.side if current_position else 'YES'
+            
+            if current_contracts > 0:
+                return TradeSignal(
+                    'SELL',
+                    current_contracts,
+                    market_price_yes if current_side == 'YES' else market_price_no,
+                    current_side,
+                    f"Hard Cutoff: <2 mins remaining",
+                    0.0,
+                    0,
+                    current_contracts
+                )
+            else:
+                return TradeSignal(
+                    'HOLD',
+                    0,
+                    market_price_yes,
+                    'YES',
+                    "Hard Cutoff: <2 mins, no new trades",
+                    0.0,
+                    0,
+                    0
+                )
+
+        # 2. MERCY RULE: Adjust probability for impossible comebacks
+        # If a team needs > 0.3 points per second to catch up, they are done.
+        # This prevents the model from "buying the dip" on a guaranteed loss.
+        catchup_rate = model_result.get('required_catchup_rate', 0)
+        if catchup_rate > 0.3:
+            if score_diff > 0: # Home is leading
+                # Home effectively 100% to win
+                model_prob = 0.999 
+                # If we held NO, this ensures we sell. If we want YES, we might buy if market < 99.
+            else: # Away is leading (Home score diff is negative)
+                # Home effectively 0% to win
+                model_prob = 0.001
+                # If we held YES, this ensures we sell.
         
         # Check Confidence Interval Width
         ci_width = model_result['ci_95_upper'] - model_result['ci_95_lower']
         if ci_width > self.risk_manager.max_ci_width:
-            # Too uncertain -> Target 0
             target_contracts = 0
+            target_side = 'YES' # Default
             reason = f"CI width {ci_width:.1%} > {self.risk_manager.max_ci_width:.1%}"
+            edge = 0.0
         else:
             # Calculate Target
-            target_contracts = self.calculate_target_position(model_prob, market_price, bankroll)
-            reason = f"Targeting {target_contracts} contracts (Edge: {edge:+.1%})"
+            target_contracts, target_side = self.calculate_target_position(
+                model_prob, market_price_yes, market_price_no, bankroll
+            )
+            
+            # Calculate edge for display
+            if target_side == 'YES':
+                edge = model_prob - (market_price_yes / 100.0)
+            else:
+                edge = (1.0 - model_prob) - (market_price_no / 100.0)
+                
+            reason = f"Targeting {target_contracts} {target_side} (Edge: {edge:+.1%})"
 
         # Current State
         current_contracts = current_position.contracts if current_position else 0
-        diff = target_contracts - current_contracts
+        current_side = current_position.side if current_position else 'YES'
         
-        # Determine Action
+        # Logic for Side Switching
+        # If we hold YES but want NO (or vice versa), we must SELL ALL first.
+        if current_contracts > 0 and current_side != target_side:
+            # We are on the wrong side. Sell everything.
+            # Note: We return a SELL signal for the CURRENT side.
+            # The next iteration will see 0 contracts and then issue a BUY for the NEW side.
+            return TradeSignal(
+                'SELL',
+                current_contracts,
+                market_price_yes if current_side == 'YES' else market_price_no,
+                current_side,
+                f"Switching sides: Sell {current_side} to target {target_side}",
+                edge,
+                target_contracts,
+                current_contracts
+            )
+            
+        # If sides match (or we have no position), proceed with standard rebalancing
+        diff = target_contracts - current_contracts
+        market_price = market_price_yes if target_side == 'YES' else market_price_no
+        
         if diff == 0:
-            return TradeSignal('HOLD', 0, market_price, "At target", edge, target_contracts, current_contracts)
+            return TradeSignal('HOLD', 0, market_price, target_side, "At target", edge, target_contracts, current_contracts)
             
         if diff > 0:
             # BUY Signal
             if diff < self.risk_manager.min_contracts:
-                return TradeSignal('HOLD', 0, market_price, f"Buy {diff} below min {self.risk_manager.min_contracts}", edge, target_contracts, current_contracts)
+                return TradeSignal('HOLD', 0, market_price, target_side, f"Buy {diff} below min {self.risk_manager.min_contracts}", edge, target_contracts, current_contracts)
             
             return TradeSignal(
                 'BUY', 
                 diff, 
-                market_price, 
-                f"Rebalancing: Buy {diff} to reach {target_contracts}", 
+                market_price,
+                target_side,
+                f"Rebalancing: Buy {diff} {target_side} to reach {target_contracts}", 
                 edge, 
                 target_contracts, 
                 current_contracts,
-                expected_value=diff * (model_prob - market_prob)
+                expected_value=diff * edge # Approx EV
             )
             
         else:
@@ -144,10 +238,19 @@ class TradingStrategy:
             sell_amount = abs(diff)
             
             if sell_amount < self.risk_manager.rebalance_threshold and target_contracts > 0:
-                # Avoid churn for small reductions unless closing completely
-                return TradeSignal('HOLD', 0, market_price, f"Sell {sell_amount} below threshold", edge, target_contracts, current_contracts)
+                return TradeSignal('HOLD', 0, market_price, target_side, f"Sell {sell_amount} below threshold", edge, target_contracts, current_contracts)
                 
             action_reason = "Take Profit/Stop Loss" if target_contracts > 0 else "Closing Position"
+            return TradeSignal(
+                'SELL', 
+                sell_amount, 
+                market_price,
+                target_side,
+                f"{action_reason}: Sell {sell_amount} to reach {target_contracts}", 
+                edge, 
+                target_contracts, 
+                current_contracts
+            )
             if edge < self.risk_manager.min_edge:
                 action_reason = f"Edge {edge:+.1%} too low"
             

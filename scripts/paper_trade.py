@@ -86,8 +86,11 @@ def get_model_prediction(tracker, game, ticker):
         total_seconds += (4 - period) * 720
     
     try:
+        score_diff = live_data['homeTeam']['score'] - live_data['awayTeam']['score']
+        required_catchup_rate = abs(score_diff) / (total_seconds + 1)
+        
         live_features = {
-            'score_diff': live_data['homeTeam']['score'] - live_data['awayTeam']['score'],
+            'score_diff': score_diff,
             'seconds_remaining': total_seconds,
             'home_efg': tracker.orch.feature_engine._calc_efg(tracker.orch.feature_engine.home_stats),
             'away_efg': tracker.orch.feature_engine._calc_efg(tracker.orch.feature_engine.away_stats),
@@ -96,6 +99,7 @@ def get_model_prediction(tracker, game, ticker):
                 tracker.orch.feature_engine.home_stats['reb'], 
                 tracker.orch.feature_engine.away_stats['reb']
             ),
+            'required_catchup_rate': required_catchup_rate,
             'game_id': game['gameId'],
             'home_team_id': game['homeTeam']['teamId'],
             'away_team_id': game['awayTeam']['teamId']
@@ -106,17 +110,31 @@ def get_model_prediction(tracker, game, ticker):
     full_feats = {**live_features, **tracker.orch.prediction_engine.current_game_context}
     model_result = tracker.orch.prediction_engine.predict_with_confidence(full_feats)
     
-    # Get Kalshi odds
-    kalshi_prob = 0.0
-    yes_price = 0
+    # Add context for strategy decisions
+    model_result['seconds_remaining'] = total_seconds
+    model_result['score_diff'] = live_features['score_diff']
+    model_result['required_catchup_rate'] = required_catchup_rate
+    
+    # Get Kalshi bid/ask prices
+    # BUY at ASK (what sellers want), SELL at BID (what buyers offer)
+    yes_bid = 0    # Price you receive when SELLING YES
+    yes_ask = 0    # Price you pay when BUYING YES
+    no_bid = 0     # Price you receive when SELLING NO
+    no_ask = 0     # Price you pay when BUYING NO
     
     try:
         details = tracker.kalshi.get_market_details(ticker)
         if details:
-            yes_price = details.get('yes_ask', 0)
-            kalshi_prob = yes_price / 100.0
+            yes_bid = details.get('yes_bid', 0)
+            yes_ask = details.get('yes_ask', 0)
+            no_bid = details.get('no_bid', 0)
+            no_ask = details.get('no_ask', 0)
     except Exception:
         pass
+    
+    # Use mid-price for implied probability display
+    yes_mid = (yes_bid + yes_ask) / 2 if (yes_bid and yes_ask) else yes_ask
+    kalshi_prob = yes_mid / 100.0 if yes_mid > 0 else 0.0
     
     clock_display = live_data.get('gameClock', '').replace('PT', '').replace('M', ':').replace('S', '')
     
@@ -124,43 +142,79 @@ def get_model_prediction(tracker, game, ticker):
         'live_data': live_data,
         'model_result': model_result,
         'kalshi_prob': kalshi_prob,
-        'yes_price': yes_price,
+        'yes_bid': yes_bid,
+        'yes_ask': yes_ask,
+        'no_bid': no_bid,
+        'no_ask': no_ask,
         'clock_display': clock_display,
         'period': period
     }
 
 
-def display_trade_signal(game, ticker, pred, signal):
-    """Display trade signal with reasoning."""
+
+def display_trade_signal(game, signal, pred):
+    """Display trade signal in table format with market vs model comparison."""
     ld = pred['live_data']
     home_team = game['homeTeam']['teamTricode']
     away_team = game['awayTeam']['teamTricode']
     
-    prob = pred['model_result']['probability']
-    market_price = pred['yes_price']
+    home_score = ld['homeTeam']['score']
+    away_score = ld['awayTeam']['score']
     
-    print(f"\n┌─ {game['gameCode']} ─ {home_team} vs {away_team}")
-    print(f"│  Score: {ld['homeTeam']['score']}-{ld['awayTeam']['score']} │ Q{pred['period']} {pred['clock_display']}")
-    print(f"├─ Odds:")
-    print(f"│  Model:  {prob:>6.1%}")
-    print(f"│  Market: {pred['kalshi_prob']:>6.1%}  ({market_price}¢)")
-    print(f"│  Edge:   {signal.edge:>+6.1%}")
-    print(f"├─ Position:")
-    print(f"│  Current: {signal.current_contracts} contracts")
-    print(f"│  Target:  {signal.target_contracts} contracts")
+    # Model probabilities
+    model_yes_prob = pred['model_result']['probability']
+    model_no_prob = 1 - model_yes_prob
     
+    # Market bid/ask prices
+    yes_bid = pred['yes_bid']
+    yes_ask = pred['yes_ask']
+    no_bid = pred['no_bid']
+    no_ask = pred['no_ask']
+    
+    # Mid prices for market probability (average of bid/ask)
+    yes_mid = (yes_bid + yes_ask) / 2 if (yes_bid and yes_ask) else yes_ask
+    no_mid = (no_bid + no_ask) / 2 if (no_bid and no_ask) else no_ask
+    market_yes_prob = yes_mid / 100.0
+    market_no_prob = no_mid / 100.0
+    
+    # Calculate edges (using mid prices)
+    yes_edge = model_yes_prob - market_yes_prob
+    no_edge = model_no_prob - market_no_prob
+    
+    # Header with game info
+    print(f"\n{'='*70}")
+    print(f"{game['gameCode']:^70}")
+    print(f"{home_team} {home_score:>3} vs {away_score:<3} {away_team}  │  Q{pred['period']} {pred['clock_display']:>8}")
+    print(f"{'='*70}")
+    
+    # Odds comparison table
+    print(f"{'':20} │ {'YES (Home)':^20} │ {'NO (Away)':^20}")
+    print(f"{'-'*20}─┼─{'-'*20}─┼─{'-'*20}")
+    print(f"{'Model Probability':20} │ {model_yes_prob:^20.1%} │ {model_no_prob:^20.1%}")
+    print(f"{'Market Bid':20} │ {yes_bid:^20.0f}¢ │ {no_bid:^20.0f}¢")
+    print(f"{'Market Ask':20} │ {yes_ask:^20.0f}¢ │ {no_ask:^20.0f}¢")
+    print(f"{'Market Mid (Prob)':20} │ {market_yes_prob:^20.1%} │ {market_no_prob:^20.1%}")
+    print(f"{'Edge':20} │ {yes_edge:^+20.1%} │ {no_edge:^+20.1%}")
+    print(f"{'-'*70}")
+    
+    # Position info
+    current_side_display = signal.side if signal.current_contracts > 0 else "NONE"
+    print(f"Position: {signal.current_contracts} contracts ({current_side_display}) → {signal.target_contracts} contracts ({signal.side})")
+    
+    # Action
     if signal.action != 'HOLD':
         cost = signal.contracts * (signal.price / 100)
-        print(f"├─ ➤ {signal.action} SIGNAL")
-        print(f"│  Amount: {signal.contracts} contracts")
-        print(f"│  Price: {signal.price:.0f}¢")
-        print(f"│  Value: ${cost:.2f}")
+        action_symbol = "📈 BUY" if signal.action == 'BUY' else "📉 SELL"
+        print(f"\n{action_symbol} {signal.contracts} {signal.side} @ {signal.price:.0f}¢ = ${cost:.2f}")
         if signal.expected_value != 0:
-            print(f"│  EV: ${signal.expected_value:+.2f}")
-        print(f"└─ {signal.reason}")
+            print(f"Expected Value: ${signal.expected_value:+.2f}")
+        print(f"Reason: {signal.reason}")
     else:
-        print(f"├─ ✋ HOLD")
-        print(f"└─ {signal.reason}")
+        print(f"\n⏸️  HOLD - {signal.reason}")
+    
+    print(f"{'='*70}\n")
+
+
 
 
 def display_portfolio_summary(engine):
@@ -183,42 +237,54 @@ def display_portfolio_summary(engine):
     print("="*80)
 
 
-def check_and_settle_games(engine, db):
-    """Check if any games have finished and settle positions."""
-    from src.data.database import Game
-    from sqlalchemy.orm import sessionmaker
-    
-    Session = sessionmaker(bind=db.engine)
-    session = Session()
-    
+def check_and_settle_games(engine, tracker):
+    """Check if any games have finished and settle positions using live data."""
     settled_any = False
     
-    try:
-        for game_id in list(engine.open_positions.keys()):
-            # Query game status
-            game = session.query(Game).filter_by(game_id=game_id).first()
-            
-            if game and game.home_score is not None and game.away_score is not None:
-                # Game has finished, check if we have final score
-                if game.home_score > game.away_score:
-                    outcome = True  # Home win
-                elif game.away_score > game.home_score:
-                    outcome = False  # Away win
-                else:
-                    continue  # Game might not be truly final (OT, etc.)
-                
-                # Settle position
-                success, message, pnl = engine.close_position(game_id, outcome)
-                
-                if success:
-                    print(f"\n{'='*80}")
-                    print(f"GAME SETTLED: {game_id}")
-                    print(message)
-                    print(f"{'='*80}")
-                    settled_any = True
+    # Build a map of game_id -> live_data for active games
+    live_games = {}
+    for match in tracker.active_matches:
+        game = match['nba_game']
+        game_id = game['gameId']
+        
+        try:
+            live_data = tracker.orch.live_client.get_live_game_data(game_id)
+            if live_data:
+                live_games[game_id] = {
+                    'home_score': live_data['homeTeam']['score'],
+                    'away_score': live_data['awayTeam']['score'],
+                    'period': live_data.get('period', 0),
+                    'clock': live_data.get('gameClock', '')
+                }
+        except:
+            pass
     
-    finally:
-        session.close()
+    # Check each open position
+    for game_id in list(engine.open_positions.keys()):
+        if game_id not in live_games:
+            continue
+            
+        game_data = live_games[game_id]
+        
+        # Check if game is truly over: Q4/OT ended and score is not tied
+        is_regulation_over = game_data['period'] >= 4 and 'PT0M0' in game_data['clock']
+        is_not_tied = game_data['home_score'] != game_data['away_score']
+        
+        if is_regulation_over and is_not_tied:
+            # Determine winner
+            home_won = game_data['home_score'] > game_data['away_score']
+            
+            # Settle position
+            success, message, pnl = engine.close_position(game_id, home_won)
+            
+            if success:
+                print(f"\n{'='*80}")
+                print(f"🏁 GAME SETTLED: {game_id}")
+                print(f"Final Score: {game_data['home_score']}-{game_data['away_score']}")
+                print(f"Outcome: {'HOME WIN' if home_won else 'AWAY WIN'}")
+                print(message)
+                print(f"{'='*80}")
+                settled_any = True
     
     return settled_any
 
@@ -264,7 +330,7 @@ def main(model_type='lr', interval=30, starting_balance=10000.0):
             print(f"{'='*80}")
             
             # Check for settled games
-            settled_any = check_and_settle_games(engine, db)
+            settled_any = check_and_settle_games(engine, tracker)
             if settled_any:
                 engine.save_state()
             
@@ -285,37 +351,72 @@ def main(model_type='lr', interval=30, starting_balance=10000.0):
                     print(f"Skipping {game['gameCode']} (no data)")
                     continue
                 
+                # Log prediction to database
+                from src.data.database import OddsHistory
+                from sqlalchemy.orm import sessionmaker
+                Session = sessionmaker(bind=db.engine)
+                session = Session()
+                try:
+                    record = OddsHistory(
+                        game_id=game_id,
+                        timestamp=datetime.utcnow(),
+                        model_home_win_prob=float(pred['model_result']['probability']),
+                        kalshi_home_win_prob=float(pred['kalshi_prob']),
+                        kalshi_market_ticker=ticker,
+                        kalshi_yes_price=int(pred['yes_ask']),  # Log ask prices (buy prices)
+                        kalshi_no_price=int(pred['no_ask']),
+                        home_team_id=game['homeTeam']['teamId'],
+                        away_team_id=game['awayTeam']['teamId']
+                    )
+                    session.add(record)
+                    session.commit()
+                except Exception as e:
+                    print(f"Warning: Failed to log prediction to DB: {e}")
+                    session.rollback()
+                finally:
+                    session.close()
+                
                 # Get current position if any
                 current_pos = engine.open_positions.get(game_id)
                 
-                # Evaluate Market (Rebalancing Logic)
+                # Evaluate Market - use ASK prices (what we'd pay to buy)
                 signal = strategy.evaluate_market(
                     game_id=game_id,
                     model_result=pred['model_result'],
-                    market_price=pred['yes_price'],
-                    bankroll=engine.balance + engine.get_portfolio_summary()['total_exposure'], # Use total equity
+                    market_price_yes=pred['yes_ask'],  # Use ASK for buying
+                    market_price_no=pred['no_ask'],    # Use ASK for buying
+                    bankroll=engine.balance + engine.get_portfolio_summary()['total_exposure'],
                     current_position=current_pos
                 )
                 
                 # Display signal
-                display_trade_signal(game, ticker, pred, signal)
+                display_trade_signal(game, signal, pred)
                 
                 # Execute Trade if needed
                 if signal.action != 'HOLD':
-                    success, message = engine.execute_trade(
+                    # Determine correct price based on action
+                    if signal.action == 'BUY':
+                        # Pay ASK price when buying
+                        execution_price = pred['yes_ask'] if signal.side == 'YES' else pred['no_ask']
+                    else:  # SELL
+                        # Receive BID price when selling
+                        execution_price = pred['yes_bid'] if signal.side == 'YES' else pred['no_bid']
+                    
+                    success, msg = engine.execute_trade(
                         game_id=game_id,
                         ticker=ticker,
                         action=signal.action,
                         contracts=signal.contracts,
-                        price=signal.price,
+                        price=execution_price,  # Use correct bid/ask
+                        side=signal.side,
                         reason=signal.reason
                     )
                     
                     if success:
-                        print(f"✓ {message}")
+                        print(f"✓ {msg}")
                         engine.save_state()
                     else:
-                        print(f"✗ Failed: {message}")
+                        print(f"✗ Failed: {msg}")
             
             # Display portfolio
             display_portfolio_summary(engine)

@@ -19,6 +19,7 @@ class Position:
     contracts: int
     avg_entry_price: float  # Weighted average entry price in cents
     timestamp: str
+    side: str = 'YES'  # 'YES' or 'NO'
     
     def add(self, new_contracts: int, price: float):
         """Add to position, updating average cost basis."""
@@ -39,6 +40,7 @@ class Position:
     
     def current_value(self, market_price: float) -> float:
         """Calculate current position value."""
+        # market_price passed in should be the price for the side we hold
         return self.contracts * (market_price / 100)
     
     def cost_basis(self) -> float:
@@ -54,16 +56,21 @@ class Position:
         Settle position when game ends.
         
         Args:
-            outcome: True if home team won (yes pays $1), False otherwise
+            outcome: True if home team won (YES wins), False otherwise
         
         Returns:
             Realized P&L
         """
-        if outcome:
-            # Won: Get $1 per contract, paid entry_price
+        # Determine if our position won
+        # YES wins if outcome is True
+        # NO wins if outcome is False
+        won = (self.side == 'YES' and outcome) or (self.side == 'NO' and not outcome)
+        
+        if won:
+            # Won: Get $1 per contract, paid avg_entry_price
             pnl = self.contracts * (1 - self.avg_entry_price / 100)
         else:
-            # Lost: Lose entry_price per contract
+            # Lost: Lose avg_entry_price per contract
             pnl = -self.cost_basis()
         
         return pnl
@@ -80,7 +87,11 @@ class ClosedTrade:
     exit_price: float
     pnl: float
     timestamp: str
+    side: str = 'YES'  # 'YES' or 'NO'
     reason: str = ""
+
+
+
 
 
 class PaperTradingEngine:
@@ -142,16 +153,17 @@ class PaperTradingEngine:
         with open(self.state_file, 'w') as f:
             json.dump(data, f, indent=2)
 
-    def execute_trade(self, game_id: str, ticker: str, action: str, contracts: int, price: float, reason: str = "") -> Tuple[bool, str]:
+    def execute_trade(self, game_id: str, ticker: str, action: str, contracts: int, price: float, side: str = 'YES', reason: str = "") -> Tuple[bool, str]:
         """
-        Execute a trade (BUY or SELL).
+        Execute a trade.
         
         Args:
-            game_id: Game identifier
+            game_id: Game ID
             ticker: Market ticker
             action: 'BUY' or 'SELL'
             contracts: Number of contracts
-            price: Price in cents (1-99)
+            price: Price per contract in cents
+            side: 'YES' or 'NO' (default 'YES')
             reason: Reason for trade
             
         Returns:
@@ -163,28 +175,30 @@ class PaperTradingEngine:
         cost = contracts * (price / 100.0)
         
         if action == 'BUY':
-            # Check funds
             if cost > self.balance:
-                return False, f"Insufficient funds: Need ${cost:.2f}, have ${self.balance:.2f}"
+                return False, f"Insufficient balance (${self.balance:.2f}) for trade (${cost:.2f})"
             
-            # Update balance
+            # Check if we already have a position on the OTHER side
+            if game_id in self.open_positions:
+                current_pos = self.open_positions[game_id]
+                if current_pos.side != side:
+                    return False, f"Cannot hold both YES and NO. Sell {current_pos.side} first."
+            
             self.balance -= cost
             
-            # Update/Create position
             if game_id in self.open_positions:
-                pos = self.open_positions[game_id]
-                old_avg = pos.avg_entry_price
-                pos.add(contracts, price)
-                msg = f"Added {contracts} contracts to {ticker} @ {price}¢ (Avg: {old_avg:.1f}¢ -> {pos.avg_entry_price:.1f}¢)"
+                self.open_positions[game_id].add(contracts, price)
+                msg = f"Added {contracts} {side} contracts to {ticker} @ {price}¢ (Avg: {self.open_positions[game_id].avg_entry_price:.1f}¢)"
             else:
                 self.open_positions[game_id] = Position(
                     game_id=game_id,
                     ticker=ticker,
                     contracts=contracts,
                     avg_entry_price=price,
-                    timestamp=datetime.now().isoformat()
+                    timestamp=datetime.now().isoformat(),
+                    side=side
                 )
-                msg = f"Opened new position: {contracts} contracts of {ticker} @ {price}¢"
+                msg = f"Opened new {side} position: {contracts} {ticker} @ {price}¢"
                 
             return True, msg
             
@@ -193,19 +207,27 @@ class PaperTradingEngine:
                 return False, "No position to sell"
             
             pos = self.open_positions[game_id]
+            
+            # Verify side matches (though strictly we only have one position per game)
+            if pos.side != side:
+                 return False, f"Mismatch: Holding {pos.side}, tried to sell {side}"
+
             if contracts > pos.contracts:
                 return False, f"Cannot sell {contracts}, only have {pos.contracts}"
             
             # Calculate P&L
-            cost_basis_of_sale = contracts * (pos.avg_entry_price / 100.0)
-            proceeds = contracts * (price / 100.0)
-            pnl = proceeds - cost_basis_of_sale
+            # P&L = (Exit Price - Avg Entry Price) * Contracts
+            pnl = contracts * ((price - pos.avg_entry_price) / 100)
             
-            # Update balance
+            # Update Balance (Principal + Profit)
+            # Principal = Contracts * Avg Entry
+            # Profit = P&L
+            # Total Return = Contracts * Exit Price
+            proceeds = contracts * (price / 100)
             self.balance += proceeds
             
-            # Record trade
-            trade = ClosedTrade(
+            # Record Trade
+            self.trade_history.append(ClosedTrade(
                 game_id=game_id,
                 ticker=ticker,
                 action='SELL',
@@ -215,23 +237,18 @@ class PaperTradingEngine:
                 pnl=pnl,
                 timestamp=datetime.now().isoformat(),
                 reason=reason
-            )
-            self.trade_history.append(trade)
+            ))
             
-            # Reduce position
+            # Reduce Position
             pos.reduce(contracts)
             
-            # Remove if empty
             if pos.contracts == 0:
                 del self.open_positions[game_id]
-                msg = f"Closed position: Sold all {contracts} {ticker} @ {price}¢ (P&L: ${pnl:+.2f})"
+                return True, f"Closed {side} position: Sold {contracts} {ticker} @ {price}¢ (P&L: ${pnl:+.2f})"
             else:
-                msg = f"Reduced position: Sold {contracts} {ticker} @ {price}¢ (P&L: ${pnl:+.2f})"
+                return True, f"Reduced {side} position: Sold {contracts} {ticker} @ {price}¢ (P&L: ${pnl:+.2f})"
                 
-            return True, msg
-            
-        else:
-            return False, f"Invalid action: {action}"
+        return False, "Invalid action"           
 
     def close_position(self, game_id: str, outcome: bool) -> Tuple[bool, str, float]:
         """

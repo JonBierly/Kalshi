@@ -83,19 +83,20 @@ def analyze_paper_trades(state_file='paper_trading_state.json'):
         
         # Best Trades
         print("TOP 5 BEST TRADES")
-        print("-" * 40)
+        print("-" * 50)
         best_trades = sorted(closed_trades, key=lambda x: x.get('pnl', 0), reverse=True)[:5]
         for i, t in enumerate(best_trades, 1):
             ticker = t.get('ticker', '').replace('KXNBAGAME-', '')[:20]
-            print(f"{i}. {ticker:<20} ${t.get('pnl', 0):>+8.2f} ({t.get('action')})")
+            side = t.get('side', 'YES')
+            print(f"{i}. {ticker:<20} {side:<4} ${t.get('pnl', 0):>+8.2f} ({t.get('action')})")
         print()
 
     # Detailed Trade Log
-    print("="*80)
+    print("="*90)
     print("TRADE HISTORY LOG (Last 50 Actions)")
-    print("="*80)
-    print(f"{'TIME':<10} {'ACTION':<8} {'TICKER':<30} {'QTY':<5} {'PRICE':<8} {'P&L':<10} {'REASON'}")
-    print("-" * 100)
+    print("="*90)
+    print(f"{'TIME':<10} {'ACTION':<8} {'SIDE':<4} {'TICKER':<30} {'QTY':<5} {'PRICE':<8} {'P&L':<10} {'REASON'}")
+    print("-" * 110)
     
     # Show last 50 actions
     recent_history = trade_history[-50:] if len(trade_history) > 50 else trade_history
@@ -110,6 +111,7 @@ def analyze_paper_trades(state_file='paper_trading_state.json'):
             
         ticker = trade.get('ticker', '').replace('KXNBAGAME-', '')[:30]
         action = trade.get('action', 'UNKNOWN')
+        side = trade.get('side', 'YES')
         qty = trade.get('contracts', 0)
         
         if action == 'BUY':
@@ -127,7 +129,7 @@ def analyze_paper_trades(state_file='paper_trading_state.json'):
             
         reason = trade.get('reason', '')[:40]
         
-        print(f"{time_str:<10} {action:<8} {ticker:<30} {qty:<5} {price_str:<8} {pnl_str:<10} {reason}")
+        print(f"{time_str:<10} {action:<8} {side:<4} {ticker:<30} {qty:<5} {price_str:<8} {pnl_str:<10} {reason}")
     
     print("-" * 100)
     print()

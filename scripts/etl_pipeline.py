@@ -3,7 +3,7 @@ from src.data.acquisition import HistoricalDataClient
 from src.data.database import DatabaseManager, Game
 import time
 
-def run_backfill(seasons=['2024-25'], limit=None):
+def run_backfill(seasons=['2025-26'], limit=None):
     """
     Fetches games from API and saves to DB for specified seasons.
     """

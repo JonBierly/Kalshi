@@ -5,7 +5,7 @@ from src.data.acquisition import HistoricalDataClient
 import time
 from nba_api.stats.static import teams
 
-def backfill_team_logs(season='2024-25'):
+def backfill_team_logs(season='2025-26'):
     """
     Iterates through all 30 NBA teams and fetches their game logs.
     Saves stats to TeamBasicStats and updates Game metadata (Home/Away IDs).
@@ -41,4 +41,4 @@ def backfill_team_logs(season='2024-25'):
 
 if __name__ == "__main__":
     # You can change the season here
-    backfill_team_logs(season='2024-25')
+    backfill_team_logs(season='2025-26')

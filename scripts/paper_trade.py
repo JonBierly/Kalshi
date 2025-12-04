@@ -39,7 +39,24 @@ def get_model_prediction(tracker, game, ticker):
     if not live_data:
         return None
     
-    # Check if game has actually started
+    # ====================================================================
+    # CRITICAL: Check if game has ACTUALLY STARTED (not pre-game)
+    # ====================================================================
+    # This model is designed for LIVE game prediction only!
+    # Do NOT trade on pre-game markets.
+    
+    # Check 1: gameStatus must be 2 (in-progress)
+    # 1 = not started, 2 = in progress, 3 = final
+    game_status = live_data.get('gameStatus', 0)
+    if game_status != 2:
+        return None
+    
+    # Check 2: Period must be >= 1 (game has tipped off)
+    period = live_data.get('period', 0)
+    if period < 1:
+        return None
+    
+    # Check 3: Stats must exist and be non-empty
     try:
         home_stats = live_data['homeTeam']['statistics']
         away_stats = live_data['awayTeam']['statistics']

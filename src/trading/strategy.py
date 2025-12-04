@@ -21,8 +21,8 @@ class RiskManager:
         max_total_exposure_pct: float = 0.30,  # 30% max total
         min_edge: float = 0.03,  # 3% minimum edge
         max_ci_width: float = 0.25,  # 25% max confidence interval width
-        min_contracts: int = 1,  # Minimum trade size
-        rebalance_threshold: int = 2  # Min contracts diff to trigger rebalance
+        min_contracts: int = 3,  # Minimum trade size
+        rebalance_threshold: int = 5  # Min contracts diff to trigger rebalance
     ):
         self.max_position_pct = max_position_pct
         self.max_total_exposure_pct = max_total_exposure_pct
@@ -62,9 +62,10 @@ class TradingStrategy:
         f = (b * p - q) / b
         return max(0.0, f)
 
-    def calculate_target_position(self, model_prob: float, market_price_yes: float, market_price_no: float, bankroll: float) -> Tuple[int, str]:
+    def calculate_target_position(self, model_prob: float, market_price_yes: float, market_price_no: float, bankroll: float, ci_width: float = 0.0) -> Tuple[int, str]:
         """
         Calculate ideal number of contracts and side (YES/NO) based on Kelly Criterion.
+        Applies uncertainty penalty based on CI width.
         """
         # Calculate Edge for YES
         market_prob_yes = market_price_yes / 100.0
@@ -98,6 +99,17 @@ class TradingStrategy:
 
         # Apply Risk Management
         adj_kelly = raw_kelly * self.fractional_kelly
+        
+        # FILTER C: Uncertainty Penalty based on CI width
+        # Wider CI → reduce position size
+        if ci_width > 0:
+            # Normalize CI width to [0, 1] using max_ci_width
+            uncertainty_factor = 1 - (ci_width / self.risk_manager.max_ci_width)
+            uncertainty_factor = max(0, uncertainty_factor)  # Clamp to [0, 1]
+            
+            # Apply penalty: wider CI → smaller Kelly fraction
+            adj_kelly = adj_kelly * uncertainty_factor
+        
         target_allocation_pct = min(adj_kelly, self.risk_manager.max_position_pct)
         
         target_capital = bankroll * target_allocation_pct
@@ -175,18 +187,48 @@ class TradingStrategy:
             reason = f"CI width {ci_width:.1%} > {self.risk_manager.max_ci_width:.1%}"
             edge = 0.0
         else:
-            # Calculate Target
-            target_contracts, target_side = self.calculate_target_position(
-                model_prob, market_price_yes, market_price_no, bankroll
-            )
+            # FILTER A: 90% Confidence Bounds Check
+            # Only trade if we're 90% confident the edge exists in the right direction
+            ci_90_lower = model_result['ci_90_lower']
+            ci_90_upper = model_result['ci_90_upper']
+            market_prob_yes = market_price_yes / 100.0
+            market_prob_no = market_price_no / 100.0
             
-            # Calculate edge for display
-            if target_side == 'YES':
-                edge = model_prob - (market_price_yes / 100.0)
+            # Determine which side has better edge
+            edge_yes = model_prob - market_prob_yes
+            edge_no = (1.0 - model_prob) - market_prob_no
+            
+            if edge_yes > edge_no:
+                # Betting YES: Need 90% confidence that true prob > market
+                # Use lower bound of CI (10th percentile)
+                confident_edge = ci_90_lower > market_prob_yes
+                potential_side = 'YES'
             else:
-                edge = (1.0 - model_prob) - (market_price_no / 100.0)
+                # Betting NO: Need 90% confidence that true prob < (1 - market_no)
+                # Use upper bound of CI (90th percentile)
+                # If ci_90_upper < (1 - market_prob_no), then we're 90% sure prob is low enough
+                confident_edge = ci_90_upper < (1.0 - market_prob_no)
+                potential_side = 'NO'
+            
+            if not confident_edge:
+                target_contracts = 0
+                target_side = potential_side
+                edge = edge_yes if potential_side == 'YES' else edge_no
+                reason = f"Not 90% confident in {potential_side} edge (CI bounds don't beat market)"
+            else:
+                # Calculate Target with uncertainty penalty (FILTER C)
+                target_contracts, target_side = self.calculate_target_position(
+                    model_prob, market_price_yes, market_price_no, bankroll,
+                    ci_width=ci_width  # Pass CI width for Kelly penalty
+                )
                 
-            reason = f"Targeting {target_contracts} {target_side} (Edge: {edge:+.1%})"
+                # Calculate edge for display
+                if target_side == 'YES':
+                    edge = model_prob - (market_price_yes / 100.0)
+                else:
+                    edge = (1.0 - model_prob) - (market_price_no / 100.0)
+                    
+                reason = f"Targeting {target_contracts} {target_side} (Edge: {edge:+.1%})"
 
         # Current State
         current_contracts = current_position.contracts if current_position else 0

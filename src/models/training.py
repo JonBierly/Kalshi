@@ -97,10 +97,14 @@ def train_models(models_to_train=['lr', 'xgboost']):
     
     feature_cols = BASE_FEATURES_LIST + ADVANCED_FEATURES_LIST
     
+    # Preserve game_id for bootstrap sampling (before filtering to features)
+    X_train_game_ids = X_train['game_id'].copy()
+    X_test_game_ids = X_test['game_id'].copy()
+    
     # Filter X to only include feature cols
     available_cols = [c for c in feature_cols if c in X_train.columns]
-    X_train = X_train[available_cols]
-    X_test = X_test[available_cols]
+    X_train_features = X_train[available_cols]
+    X_test_features = X_test[available_cols]
     
     print(f"Using {len(available_cols)} features.")
     print(f"Models to train: {', '.join(models_to_train)}\n")
@@ -108,51 +112,81 @@ def train_models(models_to_train=['lr', 'xgboost']):
     trained_models = {}
     
     # =========================================================================
-    # 2. Logistic Regression
+    # 2. Logistic Regression Ensemble (Bootstrap)
     # =========================================================================
     if 'lr' in models_to_train:
         print("=" * 80)
-        print("Training Logistic Regression...")
+        print("Training Logistic Regression Ensemble with Bootstrap...")
         print("=" * 80)
         
-        lr_model = LogisticRegression(
-            max_iter=3000,
-            solver='saga',      # Better for large datasets
-            n_jobs=-1          # Parallel processing
-        )
-
-        lr_model.fit(X_train, y_train)
+        ensemble_models = []
+        n_models = 10
         
+        # Get unique game IDs for game-level bootstrap
+        train_game_ids = X_train_game_ids.unique()
+        
+        for i in range(n_models):
+            print(f"  Training model {i+1}/{n_models}...", end=' ')
+            
+            # Game-level bootstrap sampling
+            # Sample game_ids with replacement to ensure different models see different games
+            boot_game_ids = np.random.choice(train_game_ids, len(train_game_ids), replace=True)
+            boot_mask = X_train_game_ids.isin(boot_game_ids)
+            X_boot = X_train_features[boot_mask]
+            y_boot = y_train[boot_mask]
+            
+            # Train model on bootstrap sample
+            lr_model = LogisticRegression(
+                max_iter=3000,
+                solver='saga',      # Better for large datasets
+                n_jobs=-1,          # Parallel processing
+                random_state=i
+            )
+            
+            lr_model.fit(X_boot, y_boot)
+            ensemble_models.append(lr_model)
+            print(f"Trained on {len(boot_game_ids)} games, {len(X_boot)} events")
+        
+        print(f"\nTrained {len(ensemble_models)} models in ensemble")
+        
+        # Evaluate ensemble
         import time
         start_time = time.time()
-        lr_probs = lr_model.predict_proba(X_test)[:, 1]
-        latency_ms = (time.time() - start_time) * 1000 / len(X_test)
+        ensemble_preds = np.array([m.predict_proba(X_test_features)[:, 1] for m in ensemble_models])
+        mean_preds = np.mean(ensemble_preds, axis=0)
+        latency_ms = (time.time() - start_time) * 1000 / len(X_test_features)
         
-        lr_loss = log_loss(y_test, lr_probs)
-        lr_acc = accuracy_score(y_test, lr_probs > 0.5)
-        lr_auc = roc_auc_score(y_test, lr_probs)
+        lr_loss = log_loss(y_test, mean_preds)
+        lr_acc = accuracy_score(y_test, mean_preds > 0.5)
+        lr_auc = roc_auc_score(y_test, mean_preds)
         
+        print(f"\nEnsemble Performance:")
         print(f"Log Loss: {lr_loss:.4f}")
         print(f"Accuracy: {lr_acc:.4f}")
         print(f"AUC: {lr_auc:.4f}")
         print(f"Latency: {latency_ms:.4f} ms/row")
         
         logger.log_experiment(
-            model_type='LogisticRegression',
+            model_type='LogisticRegressionEnsemble',
             features=available_cols,
-            hyperparams={'max_iter': 3000, 'solver': 'saga'},
+            hyperparams={
+                'max_iter': 3000, 
+                'solver': 'saga', 
+                'n_models': n_models,
+                'sampling': 'game-level bootstrap'
+            },
             metrics={'accuracy': lr_acc, 'log_loss': lr_loss, 'auc': lr_auc, 'latency_ms': latency_ms},
-            notes='Production model - recent features only'
+            notes='Bootstrap ensemble with game-level sampling for proper CIs'
         )
         
-        # Save LR model
+        # Save LR ensemble
         import joblib
         lr_path = 'models/nba_lr_model.pkl'
-        joblib.dump(lr_model, lr_path)
+        joblib.dump(ensemble_models, lr_path)
         print(f"✓ Saved to '{lr_path}'\n")
         
-        trained_models['lr'] = lr_model
-        trained_models['lr_probs'] = lr_probs
+        trained_models['lr'] = ensemble_models
+        trained_models['lr_probs'] = mean_preds
     
     # =========================================================================
     # 3. XGBoost Ensemble
@@ -169,8 +203,8 @@ def train_models(models_to_train=['lr', 'xgboost']):
             print(f"  Training model {i+1}/{n_models}...", end=' ')
             
             # Bootstrap sampling
-            indices = np.random.choice(len(X_train), len(X_train), replace=True)
-            X_boot = X_train.iloc[indices]
+            indices = np.random.choice(len(X_train_features), len(X_train_features), replace=True)
+            X_boot = X_train_features.iloc[indices]
             y_boot = y_train[indices]
             
             # Split bootstrap sample into train/validation for early stopping
@@ -209,9 +243,9 @@ def train_models(models_to_train=['lr', 'xgboost']):
         # Evaluate
         import time
         start_time = time.time()
-        ensemble_preds = np.array([m.predict_proba(X_test)[:, 1] for m in ensemble_models])
+        ensemble_preds = np.array([m.predict_proba(X_test_features)[:, 1] for m in ensemble_models])
         mean_preds = np.mean(ensemble_preds, axis=0)
-        latency_ms = (time.time() - start_time) * 1000 / len(X_test)
+        latency_ms = (time.time() - start_time) * 1000 / len(X_test_features)
         
         ensemble_loss = log_loss(y_test, mean_preds)
         ensemble_acc = accuracy_score(y_test, mean_preds > 0.5)

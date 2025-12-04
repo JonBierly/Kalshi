@@ -87,35 +87,28 @@ class PredictionEngine:
         
         # Confidence Intervals
         if len(preds) > 1:
-            # Ensemble: Use percentiles from predictions
+            # Ensemble: Use percentiles from bootstrap predictions
             ci_95_lower = np.percentile(preds, 2.5)
             ci_95_upper = np.percentile(preds, 97.5)
+            ci_90_lower = np.percentile(preds, 10)
+            ci_90_upper = np.percentile(preds, 90)
             ci_60_lower = np.percentile(preds, 20)
             ci_60_upper = np.percentile(preds, 80)
             ci_50_lower = np.percentile(preds, 25)
             ci_50_upper = np.percentile(preds, 75)
         else:
-            # Single model (LR): Generate synthetic CIs based on uncertainty
-            # Predictions near 0.5 are more uncertain, near 0 or 1 are more certain
-            uncertainty = 1 - abs(mean_prob - 0.5) * 2  # 0 to 1, higher = more uncertain
-            
-            # Base width scales with uncertainty (reduced from 0.15 to 0.08 for narrower CIs)
-            base_width = 0.08 * uncertainty  # Max ±8% for most uncertain
-            
-            # 95% CI: Wider
-            ci_95_lower = max(0, mean_prob - base_width * 1.5)
-            ci_95_upper = min(1, mean_prob + base_width * 1.5)
-            
-            # 60% CI: Medium
-            ci_60_lower = max(0, mean_prob - base_width * 0.8)
-            ci_60_upper = min(1, mean_prob + base_width * 0.8)
-            
-            # 50% CI: Narrower
-            ci_50_lower = max(0, mean_prob - base_width * 0.5)
-            ci_50_upper = min(1, mean_prob + base_width * 0.5)
-            
-            # Estimate std_dev for consistency
-            std_dev = base_width / 2
+            # Fallback for single model (shouldn't happen with new LR ensemble)
+            # Simple ±5% confidence interval
+            print("Warning: Single model detected, using fallback CI")
+            ci_95_lower = max(0, mean_prob - 0.05)
+            ci_95_upper = min(1, mean_prob + 0.05)
+            ci_90_lower = max(0, mean_prob - 0.04)
+            ci_90_upper = min(1, mean_prob + 0.04)
+            ci_60_lower = max(0, mean_prob - 0.03)
+            ci_60_upper = min(1, mean_prob + 0.03)
+            ci_50_lower = max(0, mean_prob - 0.02)
+            ci_50_upper = min(1, mean_prob + 0.02)
+            std_dev = 0.05 / 2
         
         latency_ms = (time.time() - start_time) * 1000
         
@@ -123,6 +116,8 @@ class PredictionEngine:
             'probability': mean_prob,
             'ci_95_lower': ci_95_lower,
             'ci_95_upper': ci_95_upper,
+            'ci_90_lower': ci_90_lower,
+            'ci_90_upper': ci_90_upper,
             'ci_60_lower': ci_60_lower,
             'ci_60_upper': ci_60_upper,
             'ci_50_lower': ci_50_lower,

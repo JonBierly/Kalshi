@@ -71,10 +71,19 @@ class OddsTracker:
         matches = []
         
         # Generate today's date code in Kalshi format (e.g., "25NOV30")
-        today = datetime.now()
-        year_code = str(today.year)[-2:]  # Last 2 digits of year (e.g., "25")
-        month_code = today.strftime('%b').upper()  # 3-letter month (e.g., "NOV")
-        day_code = today.strftime('%d')  # 2-digit day (e.g., "30")
+        # For late-night games (before 1:30 AM), use yesterday's date
+        from datetime import timedelta
+        now = datetime.now()
+        
+        # If before 1:30 AM, use yesterday's date
+        if now.hour < 1 or (now.hour == 1 and now.minute < 30):
+            game_date = now - timedelta(days=1)
+        else:
+            game_date = now
+        
+        year_code = str(game_date.year)[-2:]  # Last 2 digits of year (e.g., "25")
+        month_code = game_date.strftime('%b').upper()  # 3-letter month (e.g., "NOV")
+        day_code = game_date.strftime('%d')  # 2-digit day (e.g., "30")
         today_date_code = f"{year_code}{month_code}{day_code}"
         
         print(f"Filtering markets for today's date: {today_date_code}")

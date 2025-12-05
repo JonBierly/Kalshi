@@ -44,10 +44,13 @@ class RiskManager:
         current_positions: Dict[str, int],
         current_exposure: float,
         game_tickers: Dict[str, list],  # game_id -> [tickers]
-        portfolio=None  # Optional: for accurate exposure calculation
+        portfolio=None,  # Optional: for accurate exposure calculation
+        pending_orders=None  # Optional: list of pending orders
     ) -> Tuple[bool, str]:
         """
         Check if new order passes risk limits.
+        
+        CRITICAL: Accounts for pending orders that could fill and increase exposure.
         
         Args:
             ticker: Market ticker
@@ -58,6 +61,7 @@ class RiskManager:
             current_exposure: Current total exposure in $
             game_tickers: Map of game_id to list of tickers
             portfolio: Portfolio object (optional, for accurate exposure)
+            pending_orders: List of pending Order objects (optional)
             
         Returns:
             (approved: bool, reason: str)
@@ -72,14 +76,31 @@ class RiskManager:
         if size > self.ABSOLUTE_MAX_CONTRACTS:
             return False, f"Size {size} exceeds max {self.ABSOLUTE_MAX_CONTRACTS}"
         
-        # Check 3: Calculate new exposure
-        order_cost = self._calculate_order_exposure(side, price, size)
-        new_total_exposure = current_exposure + order_cost
+        # Check 3: Calculate potential exposure including pending orders
+        current_pos = current_positions.get(ticker, 0)
+        order_cost = self._calculate_order_exposure(side, price, size, current_pos)
         
-        if new_total_exposure > self.ABSOLUTE_MAX_EXPOSURE:
-            return False, f"Total exposure ${new_total_exposure:.2f} exceeds ${self.ABSOLUTE_MAX_EXPOSURE}"
+        # Add worst-case exposure from pending orders
+        pending_exposure = 0.0
+        if pending_orders:
+            for order in pending_orders:
+                # Calculate max exposure if this pending order fills
+                order_pos = current_positions.get(order.ticker, 0)
+                pending_cost = self._calculate_order_exposure(
+                    order.side,
+                    order.price,
+                    order.size,
+                    order_pos
+                )
+                pending_exposure += pending_cost
         
-        # Check 4: Game-level exposure
+        # Worst case: all pending orders fill + this new order
+        max_total_exposure = current_exposure + pending_exposure + order_cost
+        
+        if max_total_exposure > self.ABSOLUTE_MAX_EXPOSURE:
+            return False, f"Potential exposure ${max_total_exposure:.2f} (current: ${current_exposure:.2f}, pending: ${pending_exposure:.2f}, new: ${order_cost:.2f}) exceeds ${self.ABSOLUTE_MAX_EXPOSURE}"
+        
+        # Check 4: Game-level exposure (with pending orders)
         game_id = self._extract_game_id(ticker)
         game_exposure = self._calculate_game_exposure(
             game_id, 
@@ -92,8 +113,22 @@ class RiskManager:
             portfolio
         )
         
+        # Add pending game exposure
+        if pending_orders:
+            for order in pending_orders:
+                order_game_id = self._extract_game_id(order.ticker)
+                if order_game_id == game_id:
+                    order_pos = current_positions.get(order.ticker, 0)
+                    order_exposure = self._calculate_order_exposure(
+                        order.side,
+                        order.price,
+                        order.size,
+                        order_pos
+                    )
+                    game_exposure += order_exposure
+        
         if game_exposure > self.ABSOLUTE_MAX_GAME:
-            return False, f"Game exposure ${game_exposure:.2f} exceeds ${self.ABSOLUTE_MAX_GAME}"
+            return False, f"Game exposure ${game_exposure:.2f} (includes pending) exceeds ${self.ABSOLUTE_MAX_GAME}"
         
         # Check 5: Position limit per market (for two-sided market making)
         current_pos = current_positions.get(ticker, 0)
@@ -110,20 +145,55 @@ class RiskManager:
         # All checks passed!
         return True, "OK"
     
-    def _calculate_order_exposure(self, side: str, price: float, size: int) -> float:
+    def _calculate_order_exposure(self, side: str, price: float, size: int, current_position: int = 0) -> float:
         """
-        Calculate $ at risk for this order.
+        Calculate $ exposure from an order.
         
-        For limit orders:
-        - Buy: You pay price * size (max loss)
-        - Sell: You receive price, but could lose (100 - price) * size
+        IMPORTANT: Position-reducing orders DECREASE exposure.
+        - If short (-) and buying → reduces exposure
+        - If long (+) and selling → reduces exposure
+        
+        Args:
+            side: 'buy' or 'sell'
+            price: Price in cents
+            size: Number of contracts
+            current_position: Current position (+ long, - short)
+            
+        Returns:
+            Exposure delta in dollars (negative = reduces exposure)
         """
+        # Check if this order reduces position
+        is_reducing = False
+        if side == 'buy' and current_position < 0:  # Buying to cover short
+            is_reducing = True
+        elif side == 'sell' and current_position > 0:  # Selling to reduce long
+            is_reducing = True
+        
         if side == 'buy':
-            # Max loss: you paid this amount
-            return (price / 100.0) * size
+            # Buying YES = pay price
+            exposure = (price / 100.0) * size
         else:  # sell
-            # Max loss: contract pays $1, you got price
-            return ((100 - price) / 100.0) * size
+            # Selling YES = margin is (100 - price)
+            exposure = ((100 - price) / 100.0) * size
+        
+        # If reducing position, this actually DECREASES exposure
+        if is_reducing:
+            # Calculate actual exposure reduction
+            reduction_size = min(size, abs(current_position))
+            if reduction_size > 0:
+                # The portion that closes position reduces exposure
+                if side == 'buy':
+                    # Closing short: reduces margin requirement
+                    reduction = ((100 - price) / 100.0) * reduction_size
+                else:
+                    # Closing long: frees up capital
+                    reduction = (price / 100.0) * reduction_size
+                
+                # Net exposure change
+                exposure = exposure - reduction
+        
+        return exposure
+
     
     def _extract_game_id(self, ticker: str) -> str:
         """Extract game identifier from ticker."""

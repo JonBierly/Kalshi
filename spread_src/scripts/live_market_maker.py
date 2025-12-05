@@ -17,6 +17,10 @@ from spread_src.execution.risk_manager import RiskManager
 from spread_src.execution.portfolio import Portfolio
 from spread_src.execution.order_manager import OrderManager
 from spread_src.trading.market_maker import SpreadMarketMaker
+from spread_src.trading.quote_generator import QuoteGenerator
+from spread_src.trading.position_sizer import PositionSizer
+from spread_src.trading.market_evaluator import MarketEvaluator
+from spread_src.execution.trade_logger import TradeLogger
 from spread_src.models.spread_model import SpreadDistributionModel
 from spread_src.inference.spread_tracker import SpreadTracker
 from src.data.kalshi import KalshiClient
@@ -72,6 +76,28 @@ class LiveMarketMaker:
         
         self.risk_mgr = RiskManager(max_exposure, max_game_exposure)
         self.portfolio = Portfolio(initial_capital=max_exposure)
+        
+        # Sync with actual Kalshi positions
+        self.portfolio.sync_positions(self.kalshi)
+        
+        # CRITICAL: Build game_tickers map from synced positions
+        # Format: {game_id: [ticker1, ticker2, ...]}
+        self.game_tickers = {}
+        for ticker, pos in self.portfolio.positions.items():
+            if pos != 0:
+                # Extract game ID from ticker
+                parts = ticker.split('-')
+                if len(parts) >= 2:
+                    game_id = parts[1][:10] if len(parts[1]) >= 10 else parts[1]
+                    if game_id not in self.game_tickers:
+                        self.game_tickers[game_id] = []
+                    self.game_tickers[game_id].append(ticker)
+        
+        if self.game_tickers:
+            print(f"\n📍 Tracking {len(self.game_tickers)} games with positions:")
+            for game_id, tickers in self.game_tickers.items():
+                print(f"  {game_id}: {len(tickers)} markets")
+        
         self.order_mgr = OrderManager(self.kalshi, dry_run=dry_run)
         self.mm_strategy = SpreadMarketMaker()
         
@@ -80,8 +106,18 @@ class LiveMarketMaker:
         from spread_src.models.spread_model import SpreadDistributionModel
         self.spread_model = SpreadDistributionModel('models/nba_spread_model.pkl')
         
-        # Track game tickers for risk management
-        self.game_tickers = {}  # game_id -> [tickers]
+        # Initialize modular components
+        self.quote_generator = QuoteGenerator(max_position=5)
+        self.position_sizer = PositionSizer(kelly_fraction=0.25)
+        self.market_evaluator = MarketEvaluator(
+            spread_model=self.spread_model,
+            quote_generator=self.quote_generator,
+            position_sizer=self.position_sizer
+        )
+        
+        # Initialize database logger
+        self.trade_logger = TradeLogger('data/nba_data.db')
+        print("✓ Database logging enabled")
     
     def run(self, interval=30):
         """
@@ -122,13 +158,19 @@ class LiveMarketMaker:
                 # Step 1: Check for fills
                 fills = self.order_mgr.check_for_fills()
                 for fill in fills:
+                    # Get trade_id if we have it
+                    trade_id = self.portfolio.trade_ids.get(fill.ticker)
+                    
+                    # Update portfolio (which auto-logs to DB if trade_id provided)
                     self.portfolio.update_fill(
-                        fill.ticker,
-                        fill.side,
-                        fill.price,
-                        fill.size
+                        ticker=fill.ticker,
+                        side=fill.side,
+                        price=fill.price,
+                        size=fill.size,
+                        trade_id=trade_id
                     )
-                
+
+                                
                 # Step 2: Evaluate all markets and collect ALL opportunities
                 all_opportunities = []
                 
@@ -211,27 +253,72 @@ class LiveMarketMaker:
                             print(f"  {order.order_id}: Price changed by {price_diff:.1f}¢, canceling")
                             self.order_mgr.cancel_order(order.order_id)
                 
-                # Step 4: Place best new order (if we have room for one more)
+                # Step 4: Place best new orders (if we have room)
                 open_orders = self.order_mgr.get_open_orders()
-                MAX_ORDERS = 10  # Allow 10 orders (5 pairs)
+                MAX_ORDERS = 30  # Allow up to 15 open orders
+                MAX_POSITIONS = 10  # Max number of unique tickers with positions
+                ORDERS_PER_ITERATION = 10  # Place up to 3 orders per iteration
+                
+                # Count current unique positions
+                num_positions = sum(1 for pos in self.portfolio.positions.values() if pos != 0)
+                
+                # Calculate current exposure (including pending orders)
+                current_exposure = self.portfolio.get_exposure()
+                pending_exposure = sum(
+                    self.risk_mgr._calculate_order_exposure(
+                        o.side, o.price, o.size, self.portfolio.positions.get(o.ticker, 0)
+                    ) for o in open_orders
+                )
+                total_exposure = current_exposure + pending_exposure
+                at_max_exposure = total_exposure >= self.risk_mgr.ABSOLUTE_MAX_EXPOSURE * 0.95
                 
                 if len(open_orders) < MAX_ORDERS and all_opportunities:
-                    # Find best opportunity not already ordered
+                    # Find opportunities not already ordered
                     existing_keys = {(o.ticker, o.side) for o in open_orders}
                     new_opps = [o for o in all_opportunities if (o['ticker'], o['side']) not in existing_keys]
                     
+                    # Filter out tickers we already have positions in if at position limit
+                    if num_positions >= MAX_POSITIONS:
+                        new_opps = [o for o in new_opps if self.portfolio.positions.get(o['ticker'], 0) != 0]
+                    
+                    # CRITICAL: If at max exposure, only consider position-reducing orders
+                    if at_max_exposure:
+                        reducing_opps = []
+                        for opp in new_opps:
+                            pos = self.portfolio.positions.get(opp['ticker'], 0)
+                            is_reducing = (opp['side'] == 'buy' and pos < 0) or (opp['side'] == 'sell' and pos > 0)
+                            if is_reducing:
+                                reducing_opps.append(opp)
+                        
+                        if reducing_opps:
+                            new_opps = reducing_opps
+                            print(f"⚠️  At max exposure (${total_exposure:.2f}) - only placing position-reducing orders")
+                        else:
+                            new_opps = []
+                            print(f"⚠️  At max exposure (${total_exposure:.2f}) - no position-reducing opportunities available")
+                    
                     if new_opps:
-                        best_opp = max(new_opps, key=lambda x: x['ev'])
-                        self._place_order(best_opp)
+                        # Sort by EV and take top N
+                        new_opps.sort(key=lambda x: x['ev'], reverse=True)
+                        orders_to_place = min(ORDERS_PER_ITERATION, MAX_ORDERS - len(open_orders), len(new_opps))
+                        
+                        for i in range(orders_to_place):
+                            self._place_order(new_opps[i])
                     else:
-                        print("All good opportunities already have orders")
+                        if num_positions >= MAX_POSITIONS:
+                            print(f"At position limit ({num_positions}/{MAX_POSITIONS})")
+                        else:
+                            print("All good opportunities already have orders")
                 else:
                     if len(open_orders) >= MAX_ORDERS:
                         print(f"At order limit ({len(open_orders)}/{MAX_ORDERS})")
                     else:
                         print("No new opportunities")
                 
-                # Step 5: Display status
+                # Step 5: Check for settled positions
+                self._check_and_settle_positions()
+                
+                # Step 6: Display status
                 print(self.portfolio.get_position_summary())
                 print(self.order_mgr.get_order_summary())
                 
@@ -405,6 +492,16 @@ class LiveMarketMaker:
                 model_prob = 1 - neg_result['probabilities'][0]
                 ci_lower = 1 - neg_result['ci_90_upper'][0]
                 ci_upper = 1 - neg_result['ci_90_lower'][0]
+
+                self.trade_logger.log_prediction(
+                    game_id=game['gameId'],
+                    ticker=market.ticker,
+                    seconds_remaining=int(total_seconds),
+                    score_diff=score_diff,
+                    predicted_prob=model_prob,
+                    ci_lower=ci_lower,
+                    ci_upper=ci_upper
+                )
             
             # Convert to cents
             fair_value = model_prob * 100
@@ -413,15 +510,17 @@ class LiveMarketMaker:
             
             # Check current position
             position = self.portfolio.positions.get(market.ticker, 0)
+
+            
             
             # Market info
             bid_ask = f"{market.yes_bid}-{market.yes_ask}¢"
             model_str = f"{fair_value:.0f}¢ ({ci_lower_cents:.0f}-{ci_upper_cents:.0f})"
             pos_str = f"{position:+d}" if position != 0 else "-"
             
-            # Generate two-sided quotes
-            quotes = self._generate_two_sided_quotes(
-                ticker=market.ticker,
+            
+            # Generate two-sided quotes using QuoteGenerator
+            quotes = self.quote_generator.generate_quotes(
                 fair_value=fair_value,
                 ci_lower=ci_lower,
                 ci_upper=ci_upper,
@@ -431,275 +530,56 @@ class LiveMarketMaker:
                 seconds_remaining=total_seconds
             )
             
-            # Calculate liquidity factor (1.0 -> 0.5 based on spread)
+            # Create opportunities using MarketEvaluator
             market_spread = market.yes_ask - market.yes_bid
-            # Smooth penalty: 1.0 at 0¢ spread, 0.5 at 100¢+ spread
-            liquidity_factor = max(0.5, 1.0 - (market_spread / 200.0))
+            ci_width = ci_upper - ci_lower
+            bankroll = self.portfolio.get_available_capital()
             
-            quote_str = ""
+            market_opps = self.market_evaluator.create_opportunities_from_quotes(
+                ticker=market.ticker,
+                fair_value=fair_value,
+                quotes=quotes,
+                market_spread=market_spread,
+                position=position,
+                bankroll=bankroll,
+                ci_width=ci_width,
+                ci_lower=ci_lower,
+                ci_upper=ci_upper,
+                seconds_remaining=int(total_seconds)
+            )
             
-            if quotes['should_quote']:
-                # Create BID opportunity (if not None)
-                if quotes['bid_price'] is not None and quotes['bid_size'] > 0:
-                    base_ev = fair_value - quotes['bid_price']
-                    adjusted_ev = base_ev * liquidity_factor  # Apply liquidity penalty
-                    
-                    opportunities.append({
-                        'ticker': market.ticker,
-                        'side': 'buy',
-                        'price': quotes['bid_price'],
-                        'size': quotes['bid_size'],
-                        'ev': adjusted_ev,
-                        'reason': f"MM Bid @ {quotes['bid_price']:.0f}¢",
-                        'is_mm_quote': True
-                    })
-                    quote_str = f"BID {quotes['bid_price']:.0f}¢"
+            opportunities.extend(market_opps)
+            
+            # Only display markets with good opportunities (EV > 0)
+            if market_opps:
+                best_opp = max(market_opps, key=lambda x: x['ev'])
                 
-                # Create ASK opportunity (if not None)
-                if quotes['ask_price'] is not None and quotes['ask_size'] > 0:
-                    base_ev = quotes['ask_price'] - fair_value
-                    adjusted_ev = base_ev * liquidity_factor  # Apply liquidity penalty
-                    
-                    opportunities.append({
-                        'ticker': market.ticker,
-                        'side': 'sell',
-                        'price': quotes['ask_price'],
-                        'size': quotes['ask_size'],
-                        'ev': adjusted_ev,
-                        'reason': f"MM Ask @ {quotes['ask_price']:.0f}¢",
-                        'is_mm_quote': True
-                    })
-                    if quote_str:
-                        quote_str += f" | ASK {quotes['ask_price']:.0f}¢"
-                    else:
-                        quote_str = f"ASK {quotes['ask_price']:.0f}¢"
-            else:
-                quote_str = f"Skip: {quotes.get('reason', 'No quote')}"
-            
-            # Extract market name (e.g., "OKC >11.5")
-            ticker_parts = market.ticker.split('-')
-            market_name = ticker_parts[-1] if ticker_parts else market.ticker
-            
-            # Calculate spreads for display
-            market_spread = market.yes_ask - market.yes_bid
-            ci_width_pct = (ci_upper - ci_lower) * 100  # As percentage
-            
-            # Our quote spread (if quoting)
-            if quotes['should_quote'] and quotes['bid_price'] and quotes['ask_price']:
-                our_spread = f"{quotes['bid_price']:.0f}-{quotes['ask_price']:.0f}"
-            else:
-                our_spread = "-"
-            
-            # Format display line
-            print(f"  {market_name:<12} "
-                  f"Mkt:{market.yes_bid:3.0f}-{market.yes_ask:2.0f}¢ "
-                  f"({market_spread:2.0f}¢) "
-                  f"Model:{fair_value:3.0f}¢±{ci_width_pct:4.1f}% "
-                  f"Our:{our_spread:>8} "
-                  f"Pos:{pos_str:>3} "
-                  f"{quote_str}")
+                # Extract market shortname
+                ticker_parts = market.ticker.split('-')
+                market_name = ticker_parts[-1] if ticker_parts else market.ticker
+                
+                # EV indicator
+                if best_opp['ev'] > 30:
+                    indicator = "🔥"
+                elif best_opp['ev'] > 20:
+                   indicator = "✨"
+                else:
+                    indicator = "💡"
+                
+                # Position indicator
+                pos_str = f"(Pos: {position:+d})" if position != 0 else ""
+                
+                print(f"  {indicator} {market_name:<15} "
+                      f"{best_opp['side'].upper():<5} "
+                      f"{best_opp['size']:>2} @ {best_opp['price']:>5.1f}¢ "
+                      f"→ EV: {best_opp['ev']:>4.1f}¢ "
+                      f"{pos_str}")
+        
+        # Print summary
+        if opportunities:
+            print(f"\n📊 Found {len(opportunities)} opportunities (showing best by EV)")
         
         return opportunities
-    
-    def _calculate_kelly_size(
-        self,
-        fair_value: float,
-        price: float,
-        ci_width: float,
-        position: int = 0
-    ) -> int:
-        """
-        Calculate optimal position size using Kelly criterion.
-        
-        Args:
-            fair_value: Model prediction in cents (0-100)
-            price: Order price in cents
-            ci_width: Confidence interval width (0-1)
-            position: Current position
-            
-        Returns:
-            Number of contracts (1-10)
-        """
-        # Get available capital
-        bankroll = self.portfolio.get_available_capital()
-        
-        # Edge in cents
-        edge = abs(fair_value - price)
-        
-        # Avoid division issues
-        if price < 1 or price > 99 or bankroll < 0.10:
-            return 1
-        
-        # Kelly percentage: f = (edge/100) / (price/100)
-        kelly_pct = (edge / 100.0) / (price / 100.0)
-        
-        # Use quarter-Kelly for safety (conservative)
-        kelly_fraction = 0.25
-        
-        # Reduce Kelly if uncertain (wide CI)
-        if ci_width > 0.25:
-            kelly_fraction *= 0.5  # Half-quarter-Kelly for very uncertain
-        
-        kelly_pct *= kelly_fraction
-        
-        # Convert to number of contracts
-        # Each contract costs price/100 dollars
-        dollars_per_contract = price / 100.0
-        kelly_dollars = bankroll * kelly_pct
-        kelly_size = kelly_dollars / dollars_per_contract
-        
-        # Round and apply bounds
-        size = int(round(kelly_size))
-        
-        # Reduce if we already have position
-        if abs(position) > 3:
-            size = max(1, size // 2)
-        
-        # Hard bounds
-        size = max(1, min(10, size))
-        
-        return size
-    
-    
-    def _generate_two_sided_quotes(
-        self,
-        ticker: str,
-        fair_value: float,      # Model probability in cents (0-100)
-        ci_lower: float,        # Lower CI in probability (0-1)
-        ci_upper: float,        # Upper CI in probability (0-1)
-        market_bid: float,      # Current best bid in cents
-        market_ask: float,      # Current best ask in cents
-        position: int,          # Current position (-10 to +10)
-        seconds_remaining: float
-    ) -> dict:
-        """
-        Generate bid and ask quotes for two-sided market making.
-        
-        Strategy:
-        1. Calculate spread width from confidence interval
-        2. Post quotes around fair value
-        3. Apply inventory skewing if positioned
-        4. Ensure we beat existing market prices
-        
-        Args:
-            ticker: Market ticker
-            fair_value: Model fair value in cents (0-100)
-            ci_lower: Lower bound of 90% CI (0-1)
-            ci_upper: Upper bound of 90% CI (0-1)
-            market_bid: Current best bid in cents
-            market_ask: Current best ask in cents
-            position: Current net position
-            seconds_remaining: Time left in game
-            
-        Returns:
-            {
-                'should_quote': bool,
-                'bid_price': float or None,
-                'bid_size': int,
-                'ask_price': float or None,
-                'ask_size': int,
-                'reason': str
-            }
-        """
-        # 1. Calculate theoretical spread from confidence interval
-        ci_width = ci_upper - ci_lower
-        
-        # Continuous spread function: CI 0% → 1¢, CI 50%+ → 10¢
-        # Linear scaling with bounds
-        half_spread = max(1, min(10, 1 + (ci_width * 18)))
-        
-        # Tighter spreads in last 5 minutes
-        if seconds_remaining < 300:
-            half_spread = max(1, half_spread / 2)
-        
-        
-        # 2. Base quotes around fair value
-        theo_bid = fair_value - half_spread
-        theo_ask = fair_value + half_spread
-        
-        # 3. Apply inventory skewing
-        #    If long → widen bid (less eager to buy), tighten ask (eager to sell)
-        #    If short → tighten bid (eager to buy), widen ask (less eager to sell)
-        skew = position * 0.5  # 0.5¢ per contract
-        
-        theo_bid -= skew
-        theo_ask -= skew
-        
-        # 4. Apply price improvement (beat existing market by 1¢)
-        tick_improvement = 1
-        
-        # For bid: want to be better than current bid (higher)
-        comp_bid = min(theo_bid, market_bid + tick_improvement)
-        
-        # For ask: want to be better than current ask (lower)
-        comp_ask = max(theo_ask, market_ask - tick_improvement)
-        
-        # 5. Sanity checks
-        
-        # Check: Spread not inverted
-        if comp_bid >= comp_ask:
-            return {
-                'should_quote': False,
-                'reason': 'Spread inverted'
-            }
-        
-        # Check: Don't cross the spread
-        if comp_bid >= market_ask - 1 or comp_ask <= market_bid + 1:
-            return {
-                'should_quote': False,
-                'reason': 'Would cross spread'
-            }
-        
-        # Check: Prices in valid range
-        if comp_bid < 1 or comp_ask > 99:
-            return {
-                'should_quote': False,
-                'reason': 'Out of bounds'
-            }
-        
-        # 6. Determine sizes based on position
-        MAX_POSITION = 5
-        
-        if abs(position) >= MAX_POSITION:
-            # At position limit - only quote to reduce
-            if position > 0:  # Long - only sell
-                return {
-                    'should_quote': True,
-                    'bid_price': None,
-                    'bid_size': 0,
-                    'ask_price': comp_ask,
-                    'ask_size': min(5, abs(position)),
-                    'reason': f'Reduce long position ({position})'
-                }
-            else:  # Short - only buy
-                return {
-                    'should_quote': True,
-                    'bid_price': comp_bid,
-                    'bid_size': min(5, abs(position)),
-                    'ask_price': None,
-                    'ask_size': 0,
-                    'reason': f'Reduce short position ({position})'
-                }
-        
-        
-        # Calculate optimal sizes using Kelly criterion
-        bid_size = self._calculate_kelly_size(fair_value, comp_bid, ci_width, position)
-        ask_size = self._calculate_kelly_size(fair_value, comp_ask, ci_width, position)
-        
-        # Skew sizes based on inventory (reduce less-preferred side)
-        if position > 0:  # Long - less eager to buy more
-            bid_size = max(1, bid_size // 2)
-        elif position < 0:  # Short - less eager to sell more  
-            ask_size = max(1, ask_size // 2)
-        
-        return {
-            'should_quote': True,
-            'bid_price': comp_bid,
-            'bid_size': bid_size,
-            'ask_price': comp_ask,
-            'ask_size': ask_size,
-            'reason': f'Two-sided @ {comp_bid:.0f}-{comp_ask:.0f}¢'
-        }
     
     
     def _place_order(self, opp):
@@ -713,6 +593,9 @@ class LiveMarketMaker:
         print(f"  {opp['side'].upper()} {opp['size']} {opp['ticker']} @ {opp['price']:.1f}¢")
         print(f"  Expected value: {opp['ev']:.1f}¢")
         
+        # Get pending orders for risk check
+        pending_orders = self.order_mgr.get_open_orders()
+        
         # Risk check
         approved, reason = self.risk_mgr.check_new_order(
             ticker=opp['ticker'],
@@ -722,7 +605,8 @@ class LiveMarketMaker:
             current_positions=self.portfolio.positions,
             current_exposure=self.portfolio.get_exposure(),
             game_tickers=self.game_tickers,
-            portfolio=self.portfolio  # For accurate game exposure calculation
+            portfolio=self.portfolio,  # For accurate game exposure calculation
+            pending_orders=pending_orders  # Include pending orders in risk calc
         )
         
         if not approved:
@@ -738,11 +622,102 @@ class LiveMarketMaker:
             price=opp['price'],
             size=opp['size']
         )
-        
+        # Log order to database
         if order_id:
+            # Extract game_id from ticker (e.g., NBAHOU-0012345678-B11.5 -> 0012345678)
+            game_id = None
+            if '-' in opp['ticker']:
+                parts = opp['ticker'].split('-')
+                if len(parts) >= 2:
+                    game_id = parts[1][:10]  # First 10 chars after first dash
+            
+            trade_id = self.trade_logger.log_order_placed(
+                ticker=opp['ticker'],
+                side=opp['side'],
+                price=opp['price'],
+                size=opp['size'],
+                game_id=game_id,
+                model_fair=opp.get('model_fair'),
+                ci_lower=opp.get('ci_lower'),
+                ci_upper=opp.get('ci_upper'),
+                market_spread=opp.get('market_spread'),
+                seconds_remaining=opp.get('seconds_remaining'),
+                position_before=self.portfolio.positions.get(opp['ticker'], 0)
+            )
+            # Store trade_id for later fill logging
+            self.portfolio.trade_ids[opp['ticker']] = trade_id
             print(f"  ✓ Order placed: {order_id}")
+
         else:
             print(f"  ✗ Order failed")
+    
+    def _check_and_settle_positions(self):
+        """
+        Check Kalshi for settled markets and close positions.
+        
+        Strategy:
+        1. Check each open position
+        2. Query Kalshi API for market status
+        3. If settled, calculate P&L and close position
+        4. Log to database
+        """
+        for ticker, position in list(self.portfolio.positions.items()):
+            if position == 0:
+                continue
+            
+            try:
+                # Get market details from Kalshi
+                market = self.kalshi.get_market_details(ticker)
+                
+                if not market:
+                    continue
+                
+                # Check if market is settled
+                status = market.get('status')
+                
+                if status == 'settled':
+                    # Get settlement result
+                    result = market.get('result')  # 'yes' or 'no'
+                    
+                    if result:
+                        outcome = (result == 'yes')
+                        
+                        # Get trade_id for logging
+                        trade_id = self.portfolio.trade_ids.get(ticker)
+                        
+                        # Calculate P&L before settlement
+                        cost = self.portfolio.cost_basis.get(ticker, 0.0) * abs(position)
+                        if outcome:
+                            payout = position * 1.0 if position > 0 else 0.0
+                        else:
+                            payout = 0.0
+                        
+                        if position > 0:
+                            realized_pnl = payout - cost
+                        else:
+                            realized_pnl = cost - payout
+                        
+                        # Settle in portfolio
+                        self.portfolio.settle_market(ticker, outcome)
+                        
+                        # Log to database
+                        if trade_id:
+                            self.trade_logger.log_position_closed(
+                                trade_id=trade_id,
+                                realized_pnl=realized_pnl
+                            )
+                        
+                        print(f"\n{'='*50}")
+                        print(f"🏁 SETTLED: {ticker}")
+                        print(f"   Result: {result.upper()}")
+                        print(f"   Position: {position}")
+                        print(f"   P&L: ${realized_pnl:+.2f}")
+                        print(f"{'='*50}\n")
+                
+            except Exception as e:
+                # Don't crash the main loop on settlement errors
+                print(f"⚠️  Error checking settlement for {ticker}: {e}")
+                continue
 
 
 def main():
@@ -753,7 +728,7 @@ def main():
     
     # Configuration
     DRY_RUN = False  # SET TO FALSE FOR REAL TRADING!
-    MAX_EXPOSURE = 10.0
+    MAX_EXPOSURE = 30.0
     MAX_GAME_EXPOSURE = 5.0
     UPDATE_INTERVAL = 15
     

@@ -6,6 +6,7 @@ Tracks positions, exposure, P&L, and cash.
 
 from typing import Dict, Optional
 from datetime import datetime
+from spread_src.execution.trade_logger import TradeLogger
 
 
 class Portfolio:
@@ -19,12 +20,13 @@ class Portfolio:
     - P&L: Realized + unrealized
     """
     
-    def __init__(self, initial_capital=20.0):
+    def __init__(self, initial_capital=20.0, db_path='data/nba_data.db'):
         """
         Initialize portfolio.
         
         Args:
             initial_capital: Starting cash in dollars
+            db_path: Path to database for logging
         """
         self.initial_capital = initial_capital
         self.cash = initial_capital
@@ -40,8 +42,14 @@ class Portfolio:
         
         # Trade history
         self.trade_history = []
+        
+        # Database logger
+        self.logger = TradeLogger(db_path)
+        
+        # Track trade_ids for fills
+        self.trade_ids: Dict[str, int] = {}  # ticker -> trade_id
     
-    def update_fill(self, ticker: str, side: str, price: float, size: int, timestamp=None):
+    def update_fill(self, ticker: str, side: str, price: float, size: int, timestamp=None, trade_id=None):
         """
         Update position and cash after fill.
         
@@ -51,6 +59,7 @@ class Portfolio:
             price: Fill price in cents
             size: Contracts filled
             timestamp: Fill time (optional)
+            trade_id: Trade ID from database (optional)
         """
         if timestamp is None:
             timestamp = datetime.now()
@@ -70,6 +79,15 @@ class Portfolio:
         
         # Update cost basis
         self._update_cost_basis(ticker, side, price, size, current_pos)
+        
+        # Log fill to database
+        if trade_id:
+            self.logger.log_order_filled(
+                trade_id=trade_id,
+                fill_price=price,
+                position_after=new_pos,
+                timestamp=timestamp
+            )
         
         # Log trade
         self.trade_history.append({
@@ -246,3 +264,133 @@ class Portfolio:
                     lines.append(f"  {ticker}: {pos:+d} @ {cost:.1f}¢")
         
         return "\n".join(lines)
+    
+    def get_available_capital(self) -> float:
+        """
+        Get available capital for new trades.
+        Returns current cash (could be adjusted to account for margin requirements).
+        """
+        return self.cash
+    
+    def sync_positions(self, kalshi_client):
+        """
+        Sync portfolio with actual Kalshi positions.
+        
+        Uses fill history to calculate accurate cost basis.
+        
+        Args:
+            kalshi_client: KalshiClient instance
+        """
+        print("\n📥 Syncing positions from Kalshi...")
+        
+        try:
+            # Get all unsettled positions
+            response = kalshi_client.get_positions(settlement_status='unsettled', limit=1000)
+            market_positions = response.get('market_positions', [])
+            
+            if not market_positions:
+                print("  ✓ No existing positions")
+                return
+            
+            # Get fill history for accurate cost basis
+            fills = kalshi_client.get_fills(limit=1000)
+            
+            # Group fills by ticker
+            fills_by_ticker = {}
+            for fill in fills:
+                ticker = fill.get('ticker')
+                if ticker not in fills_by_ticker:
+                    fills_by_ticker[ticker] = []
+                fills_by_ticker[ticker].append(fill)
+            
+            # Load each position
+            for pos_data in market_positions:
+                ticker = pos_data.get('ticker')
+                position = pos_data.get('position', 0)  # Net position
+                
+                if position == 0:
+                    continue
+                
+                # Calculate cost basis from actual fills
+                if ticker in fills_by_ticker:
+                    ticker_fills = fills_by_ticker[ticker]
+                    
+                    # Sort by timestamp
+                    ticker_fills.sort(key=lambda x: x.get('created_time', ''))
+                    
+                    # Calculate weighted average cost
+                    total_cost = 0
+                    total_contracts = 0
+                    
+                    for fill in ticker_fills:
+                        side = fill.get('side', '').lower()
+                        price = fill.get('yes_price', 50)  # Price in cents
+                        count = fill.get('count', 0)  # Number of contracts
+                        
+                        if side == 'yes':  # Bought YES
+                            total_cost += price * count
+                            total_contracts += count
+                        elif side == 'no':  # Sold YES (short)
+                            total_cost += price * count
+                            total_contracts += count
+                    
+                    if total_contracts > 0:
+                        avg_cost = total_cost / total_contracts
+                    else:
+                        avg_cost = 50.0
+                else:
+                    # No fill history, use position data estimate
+                    total_cost = pos_data.get('total_cost', 0)
+                    if position != 0:
+                        avg_cost = total_cost / abs(position)
+                    else:
+                        avg_cost = 50.0
+                
+                # Update portfolio
+                self.positions[ticker] = position
+                self.cost_basis[ticker] = avg_cost
+                
+                print(f"  ✓ Loaded: {ticker[-20:]:>20} → {position:+3d} @ {avg_cost:>5.1f}¢")
+            
+            # Calculate exposure
+            total_exposure = self.get_exposure()
+            num_positions = len([p for p in self.positions.values() if p != 0])
+            print(f"\n  📊 Positions: {num_positions} | Exposure: ${total_exposure:.2f}")
+            
+        except Exception as e:
+            print(f"  ⚠️  Error syncing positions: {e}")
+            print("  Continuing with empty portfolio...")
+    
+    def should_close_position(
+        self,
+        ticker: str,
+        position: int,
+        fair_value: float,
+        market_bid: float,
+        market_ask: float
+    ) -> bool:
+        """
+        Determine if we should close a position.
+        
+        Args:
+            ticker: Market ticker
+            position: Current position (+long, -short)
+            fair_value: Model fair value in cents
+            market_bid: Current best bid
+            market_ask: Current best ask
+            
+        Returns:
+            True if we should close
+        """
+        if position == 0:
+            return False
+        
+        # Close if we can lock in profit of 5¢+ per contract
+        cost = self.cost_basis.get(ticker, 50.0)
+        
+        if position > 0:  # Long - would sell at bid
+            edge = market_bid - cost
+            return edge >= 5.0
+        else:  # Short - would buy at ask
+            edge = cost - market_ask
+            return edge >= 5.0

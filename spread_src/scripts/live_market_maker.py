@@ -253,67 +253,26 @@ class LiveMarketMaker:
                             print(f"  {order.order_id}: Price changed by {price_diff:.1f}¢, canceling")
                             self.order_mgr.cancel_order(order.order_id)
                 
-                # Step 4: Place best new orders (if we have room)
+                
+                # Step 4: Per-game order management and placement
                 open_orders = self.order_mgr.get_open_orders()
-                MAX_ORDERS = 30  # Allow up to 15 open orders
-                MAX_POSITIONS = 10  # Max number of unique tickers with positions
-                ORDERS_PER_ITERATION = 10  # Place up to 3 orders per iteration
                 
-                # Count current unique positions
-                num_positions = sum(1 for pos in self.portfolio.positions.values() if pos != 0)
+                # Group opportunities by game
+                games_dict = {}
+                for opp in all_opportunities:
+                    # Extract game ID from ticker
+                    parts = opp['ticker'].split('-')
+                    if len(parts) >= 2:
+                        game_id = parts[1][:10] if len(parts[1]) >= 10 else parts[1]
+                        if game_id not in games_dict:
+                            games_dict[game_id] = []
+                        games_dict[game_id].append(opp)
                 
-                # Calculate current exposure (including pending orders)
-                current_exposure = self.portfolio.get_exposure()
-                pending_exposure = sum(
-                    self.risk_mgr._calculate_order_exposure(
-                        o.side, o.price, o.size, self.portfolio.positions.get(o.ticker, 0)
-                    ) for o in open_orders
-                )
-                total_exposure = current_exposure + pending_exposure
-                at_max_exposure = total_exposure >= self.risk_mgr.ABSOLUTE_MAX_EXPOSURE * 0.95
+                # Process each game independently
+                for game_id, game_opps in games_dict.items():
+                    self._process_game(game_id, game_opps, open_orders)
                 
-                if len(open_orders) < MAX_ORDERS and all_opportunities:
-                    # Find opportunities not already ordered
-                    existing_keys = {(o.ticker, o.side) for o in open_orders}
-                    new_opps = [o for o in all_opportunities if (o['ticker'], o['side']) not in existing_keys]
-                    
-                    # Filter out tickers we already have positions in if at position limit
-                    if num_positions >= MAX_POSITIONS:
-                        new_opps = [o for o in new_opps if self.portfolio.positions.get(o['ticker'], 0) != 0]
-                    
-                    # CRITICAL: If at max exposure, only consider position-reducing orders
-                    if at_max_exposure:
-                        reducing_opps = []
-                        for opp in new_opps:
-                            pos = self.portfolio.positions.get(opp['ticker'], 0)
-                            is_reducing = (opp['side'] == 'buy' and pos < 0) or (opp['side'] == 'sell' and pos > 0)
-                            if is_reducing:
-                                reducing_opps.append(opp)
-                        
-                        if reducing_opps:
-                            new_opps = reducing_opps
-                            print(f"⚠️  At max exposure (${total_exposure:.2f}) - only placing position-reducing orders")
-                        else:
-                            new_opps = []
-                            print(f"⚠️  At max exposure (${total_exposure:.2f}) - no position-reducing opportunities available")
-                    
-                    if new_opps:
-                        # Sort by EV and take top N
-                        new_opps.sort(key=lambda x: x['ev'], reverse=True)
-                        orders_to_place = min(ORDERS_PER_ITERATION, MAX_ORDERS - len(open_orders), len(new_opps))
-                        
-                        for i in range(orders_to_place):
-                            self._place_order(new_opps[i])
-                    else:
-                        if num_positions >= MAX_POSITIONS:
-                            print(f"At position limit ({num_positions}/{MAX_POSITIONS})")
-                        else:
-                            print("All good opportunities already have orders")
-                else:
-                    if len(open_orders) >= MAX_ORDERS:
-                        print(f"At order limit ({len(open_orders)}/{MAX_ORDERS})")
-                    else:
-                        print("No new opportunities")
+
                 
                 # Step 5: Check for settled positions
                 self._check_and_settle_positions()
@@ -581,6 +540,121 @@ class LiveMarketMaker:
         
         return opportunities
     
+    def _process_game(self, game_id, game_opps, open_orders):
+        """
+        Process all order placement for a single game.
+        
+        Strategy:
+        1. Calculate current game exposure (positions + pending orders)
+        2. Filter opportunities by EV threshold (5¢)
+        3. Prioritize position-reducing orders if positions are losing
+        4. Place orders on both bid and ask if both +EV
+        5. Respect game exposure limit
+        
+        Args:
+            game_id: Game identifier
+            game_opps: List of opportunities for this game
+            open_orders: All currently open orders
+        """
+        EV_THRESHOLD = 5.0  # Minimum 5¢ EV to trade
+        
+        # Filter opportunities by EV threshold
+        good_opps = [o for o in game_opps if o['ev'] >= EV_THRESHOLD]
+        
+        if not good_opps:
+            return  # No profitable opportunities
+        
+        # Get tickers for this game
+        game_tickers = self.game_tickers.get(game_id, [])
+        
+        # Calculate current game exposure (positions + pending orders)
+        game_exposure = 0.0
+        
+        # Add exposure from filled positions
+        for ticker in game_tickers:
+            pos = self.portfolio.positions.get(ticker, 0)
+            if pos != 0:
+                cost_basis = self.portfolio.cost_basis.get(ticker, 50.0)
+                if pos > 0:
+                    game_exposure += (cost_basis / 100.0) * pos
+                else:
+                    game_exposure += ((100 - cost_basis) / 100.0) * abs(pos)
+        
+        # Add exposure from pending orders in this game
+        for order in open_orders:
+            if order.ticker in good_opps[0]['ticker']:  # Same game
+                order_pos = self.portfolio.positions.get(order.ticker, 0)
+                game_exposure += self.risk_mgr._calculate_order_exposure(
+                    order.side, order.price, order.size, order_pos
+                )
+        
+        # Separate closing vs opening opportunities
+        closing_opps = []
+        opening_opps = []
+        
+        for opp in good_opps:
+            pos = self.portfolio.positions.get(opp['ticker'], 0)
+            is_closing = (opp['side'] == 'buy' and pos < 0) or (opp['side'] == 'sell' and pos > 0)
+            
+            if is_closing:
+                # Check if position is losing
+                if pos != 0:
+                    cost_basis = self.portfolio.cost_basis.get(opp['ticker'], 50.0)
+                    fair_value = opp.get('model_fair', 50.0)
+                    
+                    if pos > 0:
+                        pnl = (fair_value - cost_basis) * pos / 100
+                    else:
+                        pnl = (cost_basis - fair_value) * abs(pos) / 100
+                    
+                    # Mark high priority if losing
+                    opp['priority'] = 'HIGH' if pnl < -0.25 else 'NORMAL'
+                    opp['pnl'] = pnl
+                
+                closing_opps.append(opp)
+            else:
+                opp['priority'] = 'NORMAL'
+                opening_opps.append(opp)
+        
+        # Sort closing by priority (HIGH first), then by EV
+        closing_opps.sort(key=lambda x: (x.get('priority') != 'HIGH', -x['ev']))
+        opening_opps.sort(key=lambda x: -x['ev'])
+        
+        # Determine which orders to place
+        orders_to_place = []
+        
+        # Always try to place closing orders (even if over limit)
+        if closing_opps:
+            orders_to_place.extend(closing_opps)
+        
+        # Only add opening orders if under game exposure limit
+        if game_exposure < self.risk_mgr.ABSOLUTE_MAX_GAME:
+            for opp in opening_opps:
+                # Calculate potential new exposure
+                pos = self.portfolio.positions.get(opp['ticker'], 0)
+                new_exposure = self.risk_mgr._calculate_order_exposure(
+                    opp['side'], opp['price'], opp['size'], pos
+                )
+                
+                if game_exposure + new_exposure <= self.risk_mgr.ABSOLUTE_MAX_GAME:
+                    orders_to_place.append(opp)
+                    game_exposure += new_exposure
+                else:
+                    break  # At limit
+        
+        # Filter out opportunities that already have orders
+        existing_keys = {(o.ticker, o.side) for o in open_orders}
+        new_orders = [o for o in orders_to_place if (o['ticker'], o['side']) not in existing_keys]
+        
+        # Place orders
+        if new_orders:
+            print(f"\n🎯 Game {game_id}: Placing {len(new_orders)} orders (Exposure: ${game_exposure:.2f}/${self.risk_mgr.ABSOLUTE_MAX_GAME:.2f})")
+            for opp in new_orders:
+                priority_marker = "🔴" if opp.get('priority') == 'HIGH' else ""
+                closing_marker = "[CLOSING]" if opp in closing_opps else "[OPENING]"
+                print(f"  {priority_marker} {closing_marker} {opp['ticker'][-6:]} {opp['side'].upper()} {opp['size']} @ {opp['price']:.1f}¢ (EV: {opp['ev']:.1f}¢)")
+                self._place_order(opp)
+    
     
     def _place_order(self, opp):
         """
@@ -655,69 +729,127 @@ class LiveMarketMaker:
         """
         Check Kalshi for settled markets and close positions.
         
+        FIXED VERSION:
+        - Uses 'finalized' status (Kalshi's actual status)
+        - Settles per-trade (not cumulative position)
+        - Includes Kalshi trading fees
+        
         Strategy:
-        1. Check each open position
-        2. Query Kalshi API for market status
-        3. If settled, calculate P&L and close position
-        4. Log to database
+        1. Get all filled but unsettled trades from database
+        2. Check each market's status via Kalshi API
+        3. If finalized, calculate P&L with fees
+        4. Update database and portfolio
         """
-        for ticker, position in list(self.portfolio.positions.items()):
-            if position == 0:
-                continue
-            
+        import sqlite3
+        import math
+        
+        # Helper function for Kalshi fees
+        def calculate_fee(price_cents: float, num_contracts: int) -> float:
+            """Kalshi fee: round_up(0.0175 * C * P * (1-P))"""
+            P = price_cents / 100.0
+            C = num_contracts
+            fee = 0.0175 * C * P * (1 - P)
+            return math.ceil(fee * 100) / 100.0
+        
+        # Get unsettled trades from database
+        conn = sqlite3.connect('data/nba_data.db')
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT trade_id, ticker, side, fill_price, size
+            FROM trades
+            WHERE status = 'filled'
+            AND closed_at IS NULL
+            ORDER BY trade_id
+        """)
+        
+        unsettled_trades = cursor.fetchall()
+        conn.close()
+        
+        if not unsettled_trades:
+            return  # Nothing to settle
+        
+        print(f"\n🔍 Checking {len(unsettled_trades)} unsettled trades for settlements...")
+        
+        settled_count = 0
+        
+        for trade_id, ticker, side, fill_price, size in unsettled_trades:
             try:
-                # Get market details from Kalshi
+                # Query Kalshi for market status
                 market = self.kalshi.get_market_details(ticker)
                 
                 if not market:
                     continue
                 
-                # Check if market is settled
                 status = market.get('status')
                 
-                if status == 'settled':
-                    # Get settlement result
+                # Kalshi uses 'finalized' not 'settled'
+                if status in ['finalized', 'settled']:
                     result = market.get('result')  # 'yes' or 'no'
                     
-                    if result:
-                        outcome = (result == 'yes')
-                        
-                        # Get trade_id for logging
-                        trade_id = self.portfolio.trade_ids.get(ticker)
-                        
-                        # Calculate P&L before settlement
-                        cost = self.portfolio.cost_basis.get(ticker, 0.0) * abs(position)
-                        if outcome:
-                            payout = position * 1.0 if position > 0 else 0.0
+                    if not result:
+                        continue
+                    
+                    is_yes_result = (result.lower() == 'yes')
+                    
+                    # Calculate P&L for THIS trade only (not cumulative)
+                    if side == 'buy':
+                        # Bought YES contracts
+                        cost = (fill_price / 100.0) * size
+                        payout = 1.0 * size if is_yes_result else 0.0
+                        pnl_before_fee = payout - cost
+                    elif side == 'sell':
+                        # Sold YES contracts (went short)
+                        revenue = (fill_price / 100.0) * size
+                        cost = 1.0 * size if is_yes_result else 0.0
+                        pnl_before_fee = revenue - cost
+                    else:
+                        pnl_before_fee = 0.0
+                    
+                    # Deduct Kalshi fee
+                    fee = calculate_fee(fill_price, size)
+                    realized_pnl = pnl_before_fee - fee
+                    
+                    # Update database
+                    self.trade_logger.log_position_closed(
+                        trade_id=trade_id,
+                        realized_pnl=realized_pnl
+                    )
+                    
+                    # Update portfolio (set position to 0 for this ticker)
+                    if ticker in self.portfolio.positions:
+                        current_pos = self.portfolio.positions[ticker]
+                        # Adjust position based on this trade
+                        if side == 'buy':
+                            self.portfolio.positions[ticker] = current_pos - size
                         else:
-                            payout = 0.0
+                            self.portfolio.positions[ticker] = current_pos + size
                         
-                        if position > 0:
-                            realized_pnl = payout - cost
-                        else:
-                            realized_pnl = cost - payout
-                        
-                        # Settle in portfolio
-                        self.portfolio.settle_market(ticker, outcome)
-                        
-                        # Log to database
-                        if trade_id:
-                            self.trade_logger.log_position_closed(
-                                trade_id=trade_id,
-                                realized_pnl=realized_pnl
-                            )
-                        
-                        print(f"\n{'='*50}")
-                        print(f"🏁 SETTLED: {ticker}")
-                        print(f"   Result: {result.upper()}")
-                        print(f"   Position: {position}")
-                        print(f"   P&L: ${realized_pnl:+.2f}")
-                        print(f"{'='*50}\n")
-                
+                        # If position is now 0, remove it
+                        if self.portfolio.positions[ticker] == 0:
+                            del self.portfolio.positions[ticker]
+                            if ticker in self.portfolio.cost_basis:
+                                del self.portfolio.cost_basis[ticker]
+                    
+                    settled_count += 1
+                    
+                    print(f"\n{'='*50}")
+                    print(f"🏁 SETTLED: {ticker}")
+                    print(f"   Trade: {size} @ {fill_price:.1f}¢ ({side})")
+                    print(f"   Result: {result.upper()}")
+                    print(f"   P&L: ${pnl_before_fee:+.2f}")
+                    print(f"   Fee: -${fee:.2f}")
+                    print(f"   Net: ${realized_pnl:+.2f}")
+                    print(f"{'='*50}\n")
+            
             except Exception as e:
                 # Don't crash the main loop on settlement errors
                 print(f"⚠️  Error checking settlement for {ticker}: {e}")
                 continue
+        
+        if settled_count > 0:
+            print(f"✅ Settled {settled_count} trades")
+    
 
 
 def main():
@@ -728,7 +860,7 @@ def main():
     
     # Configuration
     DRY_RUN = False  # SET TO FALSE FOR REAL TRADING!
-    MAX_EXPOSURE = 30.0
+    MAX_EXPOSURE = 20.0
     MAX_GAME_EXPOSURE = 5.0
     UPDATE_INTERVAL = 15
     

@@ -384,3 +384,29 @@ class KalshiClient:
         except Exception as e:
             print(f"Error fetching positions: {e}")
             return {'market_positions': [], 'event_positions': []}
+    
+    def get_balance(self):
+        """
+        Get account balance from Kalshi.
+        
+        Returns:
+            Dict with 'balance' (dollars) and 'portfolio_value' (dollars),
+            or None if request fails
+        """
+        endpoint = "/portfolio/balance"
+        path = "/trade-api/v2/portfolio/balance"
+        headers = self._get_headers("GET", path)
+        
+        try:
+            response = requests.get(f"{self.base_url}{endpoint}", headers=headers)
+            response.raise_for_status()
+            data = response.json()
+            # Convert from cents to dollars
+            return {
+                'balance': data.get('balance', 0) / 100.0,
+                'portfolio_value': data.get('portfolio_value', 0) / 100.0
+            }
+        except Exception as e:
+            print(f"Error fetching balance: {e}")
+            return None
+

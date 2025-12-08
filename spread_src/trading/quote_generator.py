@@ -25,7 +25,8 @@ class QuoteGenerator:
         market_bid: float,
         market_ask: float,
         position: int,
-        seconds_remaining: float
+        seconds_remaining: float,
+        cost_basis: float = None
     ) -> dict:
         """
         Generate two-sided quotes with inventory skewing.
@@ -44,6 +45,7 @@ class QuoteGenerator:
             market_ask: Current best ask in cents
             position: Current net position
             seconds_remaining: Time left in game
+            cost_basis: Average entry price for urgency calculation (optional)
             
         Returns:
             {
@@ -61,10 +63,13 @@ class QuoteGenerator:
         theo_bid = fair_value - half_spread
         theo_ask = fair_value + half_spread
         
-        # 3. Apply inventory skewing
-        theo_bid, theo_ask = self._apply_inventory_skew(theo_bid, theo_ask, position)
+        # 3. Calculate urgency premium for losing positions
+        urgency = self._calculate_urgency_premium(position, cost_basis, fair_value)
         
-        # 4. Apply price improvement
+        # 4. Apply inventory skewing with urgency
+        theo_bid, theo_ask = self._apply_inventory_skew(theo_bid, theo_ask, position, urgency)
+        
+        # 5. Apply price improvement
         comp_bid, comp_ask = self._apply_price_improvement(
             theo_bid, theo_ask, market_bid, market_ask
         )
@@ -112,14 +117,62 @@ class QuoteGenerator:
         
         return half_spread
     
+    def _calculate_urgency_premium(
+        self,
+        position: int,
+        cost_basis: float,
+        fair_value: float,
+        urgency_factor: float = 0.5,
+        max_premium: float = 20.0
+    ) -> float:
+        """
+        Calculate urgency premium for losing positions.
+        
+        When a position is underwater, add premium to closing quotes
+        to increase likelihood of exit.
+        
+        Args:
+            position: Current position (+long, -short)
+            cost_basis: Average entry price in cents
+            fair_value: Model fair value in cents
+            urgency_factor: Fraction of loss to add (0.5 = 50%)
+            max_premium: Maximum urgency premium in cents
+            
+        Returns:
+            Urgency premium in cents (always >= 0)
+        """
+        if position == 0 or cost_basis is None:
+            return 0.0
+        
+        # Calculate mark-to-market P&L per contract
+        if position > 0:  # Long position
+            pnl_per_contract = fair_value - cost_basis
+        else:  # Short position
+            pnl_per_contract = cost_basis - fair_value
+        
+        # Only add urgency for losing positions
+        if pnl_per_contract >= 0:
+            return 0.0  # Position is profitable, no urgency
+        
+        # Calculate urgency based on loss severity
+        loss_per_contract = abs(pnl_per_contract)
+        urgency = loss_per_contract * urgency_factor
+        
+        # Cap maximum urgency
+        return min(urgency, max_premium)
+    
     def _apply_inventory_skew(
         self,
         bid: float,
         ask: float,
-        position: int
+        position: int,
+        urgency_premium: float = 0.0
     ) -> tuple:
         """
-        Skew quotes based on current position.
+        Skew quotes based on position + urgency.
+        
+        Base skew: 0.5¢ per contract for inventory management
+        Urgency: Added to closing side when position is losing
         
         If long → widen bid (less eager to buy), tighten ask (eager to sell)
         If short → tighten bid (eager to buy), widen ask (less eager to sell)
@@ -128,14 +181,23 @@ class QuoteGenerator:
             bid: Theoretical bid price
             ask: Theoretical ask price
             position: Current position
+            urgency_premium: Premium to add to closing side (from urgency calc)
             
         Returns:
             (skewed_bid, skewed_ask)
         """
-        skew = position * 0.5  # 0.5¢ per contract
+        base_skew = position * 0.5  # 0.5¢ per contract
         
-        skewed_bid = bid - skew
-        skewed_ask = ask - skew
+        # Apply urgency to CLOSING side only
+        if position > 0:  # Long - closing side is ASK (sell)
+            skewed_bid = bid - base_skew
+            skewed_ask = ask - base_skew - urgency_premium  # More aggressive sell
+        elif position < 0:  # Short - closing side is BID (buy)
+            skewed_bid = bid - base_skew + urgency_premium  # More aggressive buy
+            skewed_ask = ask - base_skew
+        else:  # No position
+            skewed_bid = bid
+            skewed_ask = ask
         
         return skewed_bid, skewed_ask
     

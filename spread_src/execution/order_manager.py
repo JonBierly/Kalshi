@@ -287,6 +287,65 @@ class OrderManager:
         """Get fill history."""
         return self.fills
     
+    def build_game_times_map(self, active_matches, live_client) -> Dict[str, int]:
+        """
+        Build {game_id: seconds_remaining} map for all active games.
+        
+        Args:
+            active_matches: List of match dicts with 'nba_game' key
+            live_client: Live data client with get_live_game_data method
+            
+        Returns:
+            Dict mapping game_id to seconds remaining
+        """
+        game_times = {}
+        
+        for match in active_matches:
+            game = match['nba_game']
+            game_id = game['gameId']
+            
+            try:
+                live_data = live_client.get_live_game_data(game_id)
+                if live_data:
+                    period = live_data.get('period', 4)
+                    remaining_time = live_data.get('remaining_time', '0:00')
+                    total_secs = self._parse_time_remaining(period, remaining_time)
+                    game_times[game_id] = total_secs
+            except Exception as e:
+                # Skip games with data issues
+                continue
+        
+        return game_times
+    
+    @staticmethod
+    def _parse_time_remaining(period: int, time_str: str) -> int:
+        """
+        Parse period + time string into total seconds remaining.
+        
+        Args:
+            period: Current period (1-4)
+            time_str: Time remaining in period (e.g., "5:23")
+            
+        Returns:
+            Total seconds remaining in game
+        """
+        try:
+            if ':' in time_str:
+                mins, secs = time_str.split(':')
+                total_secs = int(mins) * 60 + int(secs)
+            else:
+                total_secs = 0
+        except:
+            total_secs = 0
+        
+        # Add remaining periods (12 minutes each)
+        if period < 4:
+            total_secs += (4 - period) * 12 * 60
+        
+        return total_secs
+    
+
+    
     def check_for_fills(self) -> List[Fill]:
         """
         Check for new fills on pending orders.
@@ -349,12 +408,15 @@ class OrderManager:
         
         lines.append(f"Pending: {len(pending)}")
         for order in pending:
-            lines.append(f"  {order.order_id}: {order.side} {order.size} {order.ticker} @ {order.price:.1f}¢")
+            # Extract market name from ticker
+            market_name = order.ticker.split('-')[-1] if '-' in order.ticker else order.ticker[-10:]
+            lines.append(f"  {market_name}: {order.side.upper()} {order.size} @ {order.price:.1f}¢")
         
         if filled:
             lines.append(f"\nFilled: {len(filled)}")
             for order in filled:
-                lines.append(f"  {order.ticker}: {order.side} {order.size} @ {order.price:.1f}¢")
+                market_name = order.ticker.split('-')[-1] if '-' in order.ticker else order.ticker[-10:]
+                lines.append(f"  {market_name}: {order.side.upper()} {order.size} @ {order.price:.1f}¢")
         
         if canceled:
             lines.append(f"\nCanceled: {len(canceled)}")

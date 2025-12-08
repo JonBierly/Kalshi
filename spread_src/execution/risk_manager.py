@@ -76,8 +76,11 @@ class RiskManager:
         if size > self.ABSOLUTE_MAX_CONTRACTS:
             return False, f"Size {size} exceeds max {self.ABSOLUTE_MAX_CONTRACTS}"
         
-        # Check 3: Calculate potential exposure including pending orders
+        # Check if this is a position-closing order
         current_pos = current_positions.get(ticker, 0)
+        is_closing = (side == 'buy' and current_pos < 0) or (side == 'sell' and current_pos > 0)
+        
+        # Check 3: Calculate potential exposure including pending orders
         order_cost = self._calculate_order_exposure(side, price, size, current_pos)
         
         # Add worst-case exposure from pending orders
@@ -97,41 +100,45 @@ class RiskManager:
         # Worst case: all pending orders fill + this new order
         max_total_exposure = current_exposure + pending_exposure + order_cost
         
-        if max_total_exposure > self.ABSOLUTE_MAX_EXPOSURE:
+        # CRITICAL: Allow closing orders even when over limit (they reduce risk)
+        if not is_closing and max_total_exposure > self.ABSOLUTE_MAX_EXPOSURE:
             return False, f"Potential exposure ${max_total_exposure:.2f} (current: ${current_exposure:.2f}, pending: ${pending_exposure:.2f}, new: ${order_cost:.2f}) exceeds ${self.ABSOLUTE_MAX_EXPOSURE}"
         
-        # Check 4: Game-level exposure (with pending orders)
-        game_id = self._extract_game_id(ticker)
-        game_exposure = self._calculate_game_exposure(
-            game_id, 
-            ticker, 
-            side, 
-            price, 
-            size,
-            current_positions,
-            game_tickers,
-            portfolio
-        )
         
-        # Add pending game exposure
-        if pending_orders:
-            for order in pending_orders:
-                order_game_id = self._extract_game_id(order.ticker)
-                if order_game_id == game_id:
-                    order_pos = current_positions.get(order.ticker, 0)
-                    order_exposure = self._calculate_order_exposure(
-                        order.side,
-                        order.price,
-                        order.size,
-                        order_pos
-                    )
-                    game_exposure += order_exposure
+        # Check 4: Game-level exposure (always check for opening trades)
+        # Closing orders are allowed even if game is over limit
         
-        if game_exposure > self.ABSOLUTE_MAX_GAME:
-            return False, f"Game exposure ${game_exposure:.2f} (includes pending) exceeds ${self.ABSOLUTE_MAX_GAME}"
+        if not is_closing:  # Only check game exposure for opening trades
+            game_id = self._extract_game_id(ticker)
+            game_exposure = self._calculate_game_exposure(
+                game_id, 
+                ticker, 
+                side, 
+                price, 
+                size,
+                current_positions,
+                game_tickers,
+                portfolio
+            )
+            
+            # Add pending game exposure
+            if pending_orders:
+                for order in pending_orders:
+                    order_game_id = self._extract_game_id(order.ticker)
+                    if order_game_id == game_id:
+                        order_pos = current_positions.get(order.ticker, 0)
+                        order_exposure = self._calculate_order_exposure(
+                            order.side,
+                            order.price,
+                            order.size,
+                            order_pos
+                        )
+                        game_exposure += order_exposure
+            
+            if game_exposure > self.ABSOLUTE_MAX_GAME:
+                return False, f"Game exposure ${game_exposure:.2f} (includes pending) exceeds ${self.ABSOLUTE_MAX_GAME}"
         
         # Check 5: Position limit per market (for two-sided market making)
-        current_pos = current_positions.get(ticker, 0)
         if side == 'buy':
             new_pos = current_pos + size
         else:
@@ -204,6 +211,40 @@ class RiskManager:
             return parts[1][:13]  # YYMMMDDTEAMTEAM
         return ticker
     
+    @staticmethod
+    def extract_game_key(ticker: str) -> Optional[str]:
+        """
+        Extract 13-character game key from ticker for time lookups.
+        
+        Args:
+            ticker: Market ticker (e.g., 'KXNBASPREAD-25DEC03LACATL-LAC8')
+            
+        Returns:
+            Game key (e.g., '25DEC03LACATL') or None
+        """
+        parts = ticker.split('-')
+        if len(parts) >= 2 and len(parts[1]) >= 13:
+            return parts[1][:13]
+        return None
+    
+    @staticmethod
+    def extract_date_from_ticker(ticker: str) -> Optional[str]:
+        """
+        Extract date portion from ticker.
+        
+        Args:
+            ticker: Market ticker
+            
+        Returns:
+            Date string (e.g., '25DEC03') or None
+        """
+        parts = ticker.split('-')
+        if len(parts) >= 2 and len(parts[1]) >= 7:
+            return parts[1][:7]
+        return None
+    
+
+    
     def _calculate_game_exposure(
         self,
         game_id: str,
@@ -241,8 +282,9 @@ class RiskManager:
                     # Fallback: estimate exposure (use 50¢ as average price)
                     exposure += abs(pos) * 0.50
         
-        # Add new order exposure
-        exposure += self._calculate_order_exposure(new_side, new_price, new_size)
+        # Add new order exposure (CRITICAL: pass current position for accurate calculation)
+        new_pos = current_positions.get(new_ticker, 0)
+        exposure += self._calculate_order_exposure(new_side, new_price, new_size, new_pos)
         
         print(f"  DEBUG: Game {game_id[:13]} exposure: ${exposure:.2f} (limit: ${self.ABSOLUTE_MAX_GAME:.2f})")
         

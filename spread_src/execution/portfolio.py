@@ -20,16 +20,16 @@ class Portfolio:
     - P&L: Realized + unrealized
     """
     
-    def __init__(self, initial_capital=20.0, db_path='data/nba_data.db'):
+    def __init__(self, max_exposure=20.0, db_path='data/nba_data.db'):
         """
         Initialize portfolio.
         
         Args:
-            initial_capital: Starting cash in dollars
+            max_exposure: Maximum exposure limit in dollars (risk limit, not cash)
             db_path: Path to database for logging
         """
-        self.initial_capital = initial_capital
-        self.cash = initial_capital
+        self.max_exposure = max_exposure
+        self.cash = None  # Will be synced from Kalshi balance
         
         # Positions: ticker -> contracts (+ long, - short)
         self.positions: Dict[str, int] = {}
@@ -170,6 +170,135 @@ class Portfolio:
         print(f"  Payout: ${payout:.2f}")
         print(f"  Realized P&L: ${realized:+.2f}")
     
+    def settle_unsettled_trades(self, kalshi_client, trade_logger):
+        """
+        Check Kalshi for finalized markets and settle all unsettled trades.
+        
+        This method:
+        1. Queries database for all filled but unsettled trades
+        2. Checks each market's status via Kalshi API
+        3. Calculates P&L with Kalshi fees for finalized markets
+        4. Updates database and portfolio state
+        
+        Args:
+            kalshi_client: KalshiClient instance for API calls
+            trade_logger: TradeLogger instance for database updates
+            
+        Returns:
+            Number of trades settled
+        """
+        import sqlite3
+        from spread_src.utils.kalshi_fees import calculate_kalshi_fee
+        
+        # Get unsettled trades from database
+        conn = sqlite3.connect(self.logger.db_path) # Changed self.trade_logger to self.logger
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT trade_id, ticker, side, fill_price, size
+            FROM trades
+            WHERE status = 'filled'
+            AND closed_at IS NULL
+            ORDER BY trade_id
+        """)
+        
+        unsettled_trades = cursor.fetchall()
+        conn.close()
+        
+        if not unsettled_trades:
+            return 0  # Nothing to settle
+        
+        print(f"\n🔍 Checking {len(unsettled_trades)} unsettled trades...")
+        
+        settled_count = 0
+        
+        for trade_id, ticker, side, fill_price, size in unsettled_trades:
+            try:
+                # Query Kalshi for market status
+                market = kalshi_client.get_market_details(ticker)
+                
+                if not market:
+                    continue
+                
+                status = market.get('status')
+                
+                # Kalshi uses 'finalized' for settled markets
+                if status in ['finalized', 'settled']:
+                    result = market.get('result')  # 'yes' or 'no'
+                    
+                    if not result:
+                        continue
+                    
+                    is_yes_result = (result.lower() == 'yes')
+                    
+                    # Calculate P&L for THIS specific trade
+                    if side == 'buy':
+                        # Bought YES contracts
+                        cost = (fill_price / 100.0) * size
+                        payout = 1.0 * size if is_yes_result else 0.0
+                        pnl_before_fee = payout - cost
+                    elif side == 'sell':
+                        # Sold YES contracts (went short)
+                        revenue = (fill_price / 100.0) * size
+                        cost = 1.0 * size if is_yes_result else 0.0
+                        pnl_before_fee = revenue - cost
+                    else:
+                        pnl_before_fee = 0.0
+                    
+                    # Deduct Kalshi fee
+                    fee = calculate_kalshi_fee(fill_price, size)
+                    realized_pnl = pnl_before_fee - fee
+                    
+                    # Update database
+                    self.logger.log_position_closed( # Changed trade_logger to self.logger
+                        trade_id=trade_id,
+                        realized_pnl=realized_pnl
+                    )
+                    
+                    # Update portfolio positions
+                    # This logic assumes that each 'trade' in the database represents a single fill
+                    # and that closing a position means reversing the effect of that fill on the portfolio.
+                    # This is a simplified approach for settling individual trades.
+                    # The `settle_market` method handles full market settlement and clearing the entire position.
+                    # For `settle_unsettled_trades`, we are just marking individual fills as closed.
+                    # The portfolio's `positions` and `cost_basis` are primarily updated by `update_fill`
+                    # and `sync_positions`. This method doesn't directly modify `self.positions` or `self.cost_basis`
+                    # in a way that would reflect the *current* state of the portfolio after settlement,
+                    # but rather marks the *trade* as settled.
+                    # The provided code snippet for updating portfolio positions here seems to be
+                    # attempting to reverse the effect of the trade on the portfolio's net position,
+                    # which might be redundant or conflict with `sync_positions` if not carefully managed.
+                    # For now, I'll keep the provided logic for `self.positions` and `self.cost_basis` updates.
+                    if ticker in self.positions:
+                        current_pos = self.positions[ticker]
+                        # Adjust position based on this trade
+                        if side == 'buy':
+                            self.positions[ticker] = current_pos - size
+                        else:
+                            self.positions[ticker] = current_pos + size
+                        
+                        # If position is now 0, remove it
+                        if self.positions[ticker] == 0:
+                            del self.positions[ticker]
+                            if ticker in self.cost_basis:
+                                del self.cost_basis[ticker]
+                    
+                    self.realized_pnl += realized_pnl # Add realized P&L to portfolio total
+                    self.cash += realized_pnl # Adjust cash for realized P&L
+                    
+                    settled_count += 1
+                    
+                    print(f"  🏁 {ticker[-10:]}: {size} @ {fill_price:.1f}¢ → ${realized_pnl:+.2f}")
+            
+            except Exception as e:
+                print(f"  ⚠️  Error settling trade {trade_id} for {ticker}: {e}") # Added error message
+                continue
+        
+        if settled_count > 0:
+            print(f"✅ Settled {settled_count} trades")
+        
+        return settled_count
+    
     def get_exposure(self) -> float:
         """
         Calculate total exposure ($ at risk).
@@ -261,22 +390,61 @@ class Portfolio:
             for ticker, pos in self.positions.items():
                 if pos != 0:
                     cost = self.cost_basis.get(ticker, 0.0)
-                    lines.append(f"  {ticker}: {pos:+d} @ {cost:.1f}¢")
+                    # Extract market name from ticker (e.g., KXNBASPREAD-25DEC07ORLNYK-NYK2 -> NYK2)
+                    market_name = ticker.split('-')[-1] if '-' in ticker else ticker[-10:]
+                    lines.append(f"  {market_name}: {pos:+d} @ {cost:.1f}¢")
         
         return "\n".join(lines)
     
     def get_available_capital(self) -> float:
         """
         Get available capital for new trades.
-        Returns current cash (could be adjusted to account for margin requirements).
+        
+        Accounts for margin held by Kalshi on short positions.
+        When you sell YES contracts, Kalshi holds $1.00/contract as margin.
         """
-        return self.cash
+        # Start with total cash
+        available = self.cash
+        
+        # Subtract margin held for short positions
+        # For each short position, Kalshi holds $1.00 per contract
+        for ticker, position in self.positions.items():
+            if position < 0:  # Short position
+                margin_held = abs(position) * 1.00  # $1 per contract
+                available -= margin_held
+        
+        return max(0.0, available)  # Can't be negative
+    
+    def sync_balance(self, kalshi_client):
+        """
+        Sync cash balance from Kalshi account.
+        
+        Args:
+            kalshi_client: KalshiClient instance
+        """
+        print("\n💰 Syncing balance from Kalshi...")
+        
+        try:
+            balance_data = kalshi_client.get_balance()
+            if balance_data:
+                self.cash = balance_data['balance']
+                portfolio_value = balance_data['portfolio_value']
+                print(f"  ✓ Balance: ${self.cash:.2f}")
+                print(f"  ✓ Portfolio Value: ${portfolio_value:.2f}")
+            else:
+                print("  ⚠️  Failed to fetch balance, using max_exposure as fallback")
+                self.cash = self.max_exposure
+        except Exception as e:
+            print(f"  ⚠️  Error syncing balance: {e}")
+            print(f"  Using max_exposure (${self.max_exposure:.2f}) as fallback")
+            self.cash = self.max_exposure
     
     def sync_positions(self, kalshi_client):
         """
         Sync portfolio with actual Kalshi positions.
         
         Uses fill history to calculate accurate cost basis.
+        Note: Cash is synced separately via sync_balance().
         
         Args:
             kalshi_client: KalshiClient instance
@@ -287,6 +455,11 @@ class Portfolio:
             # Get all unsettled positions
             response = kalshi_client.get_positions(settlement_status='unsettled', limit=1000)
             market_positions = response.get('market_positions', [])
+            
+            # CRITICAL: Clear existing positions before syncing
+            # This ensures settled positions are removed
+            self.positions.clear()
+            self.cost_basis.clear()
             
             if not market_positions:
                 print("  ✓ No existing positions")

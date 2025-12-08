@@ -68,17 +68,20 @@ class LiveMarketMaker:
         print(f"Max per game: ${max_game_exposure}")
         print("=" * 80)
         
+        # Track model fair values for position display
+        self.model_fair_values = {}  # ticker -> fair_value in cents
+        
         # Initialize components
-        print("\n Initializing...")
+        print("\n✓ Initializing...")
         
         self.kalshi = KalshiClient(kalshi_key_id, kalshi_key_path)
-        self.tracker = SpreadTracker(kalshi_key_id, kalshi_key_path)
         
         self.risk_mgr = RiskManager(max_exposure, max_game_exposure)
-        self.portfolio = Portfolio(initial_capital=max_exposure)
+        self.portfolio = Portfolio(max_exposure=max_exposure)
         
-        # Sync with actual Kalshi positions
-        self.portfolio.sync_positions(self.kalshi)
+        # Sync with actual Kalshi account
+        self.portfolio.sync_balance(self.kalshi)  # Get real cash balance
+        self.portfolio.sync_positions(self.kalshi)  # Get positions
         
         # CRITICAL: Build game_tickers map from synced positions
         # Format: {game_id: [ticker1, ticker2, ...]}
@@ -105,6 +108,9 @@ class LiveMarketMaker:
         print("Loading spread model...")
         from spread_src.models.spread_model import SpreadDistributionModel
         self.spread_model = SpreadDistributionModel('models/nba_spread_model.pkl')
+        
+        # Initialize spread tracker
+        self.tracker = SpreadTracker(kalshi_key_id, kalshi_key_path)
         
         # Initialize modular components
         self.quote_generator = QuoteGenerator(max_position=5)
@@ -190,32 +196,17 @@ class LiveMarketMaker:
                     print(f"\nManaging {len(open_orders)} pending orders...")
                     
                     # Build game time lookup for late-game cancellation
-                    game_times = {}
-                    for match in self.tracker.active_matches:
-                        game = match['nba_game']
-                        game_id = game['gameId']
-                        live_data = self.tracker.orch.live_client.get_live_game_data(game_id)
-                        if live_data:
-                            period = live_data.get('period', 4)
-                            remaining_time = live_data.get('remaining_time', '0:00')
-                            try:
-                                if ':' in remaining_time:
-                                    mins, secs = remaining_time.split(':')
-                                    total_secs = int(mins) * 60 + int(secs)
-                                else:
-                                    total_secs = 0
-                            except:
-                                total_secs = 0
-                            if period < 4:
-                                total_secs += (4 - period) * 12 * 60
-                            game_times[game_id] = total_secs
+                    game_times = self.order_mgr.build_game_times_map(
+                        self.tracker.active_matches,
+                        self.tracker.orch.live_client
+                    )
                     
                     for order in open_orders:
-                        # Extract game ID from ticker (e.g., KXNBASPREAD-25DEC03LACATL-LAC8)
-                        ticker_parts = order.ticker.split('-')
-                        if len(ticker_parts) >= 2:
-                            game_key = ticker_parts[1][:13]  # e.g., "25DEC03LACATL"
-                            
+                        # Extract game key from ticker
+                        from spread_src.execution.risk_manager import RiskManager
+                        game_key = RiskManager.extract_game_key(order.ticker)
+                        
+                        if game_key:
                             # Find matching game time
                             order_game_time = None
                             for game_id, time_remaining in game_times.items():
@@ -228,6 +219,7 @@ class LiveMarketMaker:
                                 print(f"  {order.order_id}: Late game ({order_game_time}s left), canceling")
                                 self.order_mgr.cancel_order(order.order_id)
                                 continue
+
                         
                         # Find current opportunity for this ticker+side
                         current_opp = next(
@@ -278,7 +270,7 @@ class LiveMarketMaker:
                 self._check_and_settle_positions()
                 
                 # Step 6: Display status
-                print(self.portfolio.get_position_summary())
+                self._print_enhanced_position_summary()
                 print(self.order_mgr.get_order_summary())
                 
                 # Wait
@@ -288,8 +280,31 @@ class LiveMarketMaker:
         except KeyboardInterrupt:
             print("\n\nStopping market maker...")
             self.order_mgr.cancel_all_orders()
-            print(self.portfolio.get_position_summary())
+            self._print_enhanced_position_summary()
             print("\n✓ Shutdown complete")
+    
+    def _print_enhanced_position_summary(self):
+        """Print portfolio summary with model fair values."""
+        print("\n=== PORTFOLIO ===")
+        print(f"Cash: ${self.portfolio.cash:.2f}")
+        print(f"Exposure: ${self.portfolio.get_exposure():.2f}")
+        print(f"Realized P&L: ${self.portfolio.realized_pnl:+.2f}")
+        print(f"\nPositions:")
+        
+        if not self.portfolio.positions or all(p == 0 for p in self.portfolio.positions.values()):
+            print("  (none)")
+        else:
+            for ticker, pos in self.portfolio.positions.items():
+                if pos != 0:
+                    cost = self.portfolio.cost_basis.get(ticker, 0.0)
+                    market_name = ticker.split('-')[-1] if '-' in ticker else ticker[-10:]
+                    
+                    # Get model fair value if available
+                    model_fair = self.model_fair_values.get(ticker)
+                    if model_fair is not None:
+                        print(f"  {market_name}: {pos:+d} @ {cost:.1f}¢ (Model: {model_fair:.1f}¢)")
+                    else:
+                        print(f"  {market_name}: {pos:+d} @ {cost:.1f}¢")
     
     def _evaluate_game(self, game, spread_markets):
         """
@@ -402,9 +417,10 @@ class LiveMarketMaker:
         home_tri = game['homeTeam']['teamTricode']
         away_tri = game['awayTeam']['teamTricode']
         
-        print(f"\n{away_tri} @ {home_tri}:")
-        print(f"  Score: {away_tri} {away_score} @ {home_tri} {home_score}")
-        print(f"  Model: μ={mean_diff:+.1f}, σ={std_diff:.1f}")
+        # Calculate actual spread
+        actual_spread = home_score - away_score
+        
+        print(f"\n{away_tri} {away_score} @ {home_tri} {home_score} (Spread: {actual_spread:+.0f} | Model: {mean_diff:+.1f}±{std_diff:.1f})")
         
         # Refresh orderbook prices
         print("  Refreshing prices...")
@@ -423,8 +439,8 @@ class LiveMarketMaker:
         # Evaluate each market
         opportunities = []
         
-        print(f"\n  {'Market':<25} {'Bid-Ask':<12} {'Model (CI)':<20} {'Position':<10} {'Best EV'}")
-        print(f"  {'-'*25} {'-'*12} {'-'*20} {'-'*10} {'-'*10}")
+        print(f"\n  {'Market':<15} {'Position':<10} {'Order':<20} {'Model':<10} {'EV':<10}")
+        print(f"  {'-'*15} {'-'*10} {'-'*20} {'-'*10} {'-'*10}")
         
         # Get all thresholds for batch prediction
         thresholds = [m.spread for m in spread_markets]
@@ -467,6 +483,9 @@ class LiveMarketMaker:
             ci_lower_cents = ci_lower * 100
             ci_upper_cents = ci_upper * 100
             
+            # Store model fair value for position display
+            self.model_fair_values[market.ticker] = fair_value
+            
             # Check current position
             position = self.portfolio.positions.get(market.ticker, 0)
 
@@ -486,13 +505,15 @@ class LiveMarketMaker:
                 market_bid=market.yes_bid,
                 market_ask=market.yes_ask,
                 position=position,
-                seconds_remaining=total_seconds
+                seconds_remaining=total_seconds,
+                cost_basis=self.portfolio.cost_basis.get(market.ticker, None)
             )
             
             # Create opportunities using MarketEvaluator
             market_spread = market.yes_ask - market.yes_bid
             ci_width = ci_upper - ci_lower
-            bankroll = self.portfolio.get_available_capital()
+            # Use max game exposure as bankroll for Kelly sizing (each game gets independent allocation)
+            bankroll = self.risk_mgr.ABSOLUTE_MAX_GAME
             
             market_opps = self.market_evaluator.create_opportunities_from_quotes(
                 ticker=market.ticker,
@@ -525,14 +546,19 @@ class LiveMarketMaker:
                 else:
                     indicator = "💡"
                 
-                # Position indicator
-                pos_str = f"(Pos: {position:+d})" if position != 0 else ""
+                # Position display
+                pos_display = f"{position:+d}" if position != 0 else "-"
                 
-                print(f"  {indicator} {market_name:<15} "
-                      f"{best_opp['side'].upper():<5} "
-                      f"{best_opp['size']:>2} @ {best_opp['price']:>5.1f}¢ "
-                      f"→ EV: {best_opp['ev']:>4.1f}¢ "
-                      f"{pos_str}")
+                # Order display: SIDE SIZE @ PRICE
+                order_str = f"{best_opp['side'].upper()} {best_opp['size']} @ {best_opp['price']:.1f}¢"
+                
+                # Model value
+                model_display = f"{fair_value:.1f}¢"
+                
+                # EV display
+                ev_display = f"{best_opp['ev']:+.1f}¢"
+                
+                print(f"  {indicator} {market_name:<12} {pos_display:<10} {order_str:<20} {model_display:<10} {ev_display}")
         
         # Print summary
         if opportunities:
@@ -556,10 +582,18 @@ class LiveMarketMaker:
             game_opps: List of opportunities for this game
             open_orders: All currently open orders
         """
-        EV_THRESHOLD = 5.0  # Minimum 5¢ EV to trade
+        EV_THRESHOLD_OPENING = 5.0  # Minimum 5¢ EV for new positions
+        EV_THRESHOLD_CLOSING = 0.0  # Minimum 2¢ EV for closing positions (lower to reduce risk)
         
-        # Filter opportunities by EV threshold
-        good_opps = [o for o in game_opps if o['ev'] >= EV_THRESHOLD]
+        # Filter opportunities by EV threshold (checking if closing or opening)
+        good_opps = []
+        for opp in game_opps:
+            pos = self.portfolio.positions.get(opp['ticker'], 0)
+            is_closing = (opp['side'] == 'buy' and pos < 0) or (opp['side'] == 'sell' and pos > 0)
+            
+            threshold = EV_THRESHOLD_CLOSING if is_closing else EV_THRESHOLD_OPENING
+            if opp['ev'] >= threshold:
+                good_opps.append(opp)
         
         if not good_opps:
             return  # No profitable opportunities
@@ -720,135 +754,24 @@ class LiveMarketMaker:
             )
             # Store trade_id for later fill logging
             self.portfolio.trade_ids[opp['ticker']] = trade_id
-            print(f"  ✓ Order placed: {order_id}")
 
         else:
             print(f"  ✗ Order failed")
+    
     
     def _check_and_settle_positions(self):
         """
         Check Kalshi for settled markets and close positions.
         
-        FIXED VERSION:
-        - Uses 'finalized' status (Kalshi's actual status)
-        - Settles per-trade (not cumulative position)
-        - Includes Kalshi trading fees
-        
-        Strategy:
-        1. Get all filled but unsettled trades from database
-        2. Check each market's status via Kalshi API
-        3. If finalized, calculate P&L with fees
-        4. Update database and portfolio
+        Delegates to Portfolio.settle_unsettled_trades() which handles all settlement logic.
+        Then re-syncs positions from Kalshi to ensure exposure is accurate.
         """
-        import sqlite3
-        import math
+        # Try to settle trades from database
+        self.portfolio.settle_unsettled_trades(self.kalshi, self.trade_logger)
         
-        # Helper function for Kalshi fees
-        def calculate_fee(price_cents: float, num_contracts: int) -> float:
-            """Kalshi fee: round_up(0.0175 * C * P * (1-P))"""
-            P = price_cents / 100.0
-            C = num_contracts
-            fee = 0.0175 * C * P * (1 - P)
-            return math.ceil(fee * 100) / 100.0
-        
-        # Get unsettled trades from database
-        conn = sqlite3.connect('data/nba_data.db')
-        cursor = conn.cursor()
-        
-        cursor.execute("""
-            SELECT trade_id, ticker, side, fill_price, size
-            FROM trades
-            WHERE status = 'filled'
-            AND closed_at IS NULL
-            ORDER BY trade_id
-        """)
-        
-        unsettled_trades = cursor.fetchall()
-        conn.close()
-        
-        if not unsettled_trades:
-            return  # Nothing to settle
-        
-        print(f"\n🔍 Checking {len(unsettled_trades)} unsettled trades for settlements...")
-        
-        settled_count = 0
-        
-        for trade_id, ticker, side, fill_price, size in unsettled_trades:
-            try:
-                # Query Kalshi for market status
-                market = self.kalshi.get_market_details(ticker)
-                
-                if not market:
-                    continue
-                
-                status = market.get('status')
-                
-                # Kalshi uses 'finalized' not 'settled'
-                if status in ['finalized', 'settled']:
-                    result = market.get('result')  # 'yes' or 'no'
-                    
-                    if not result:
-                        continue
-                    
-                    is_yes_result = (result.lower() == 'yes')
-                    
-                    # Calculate P&L for THIS trade only (not cumulative)
-                    if side == 'buy':
-                        # Bought YES contracts
-                        cost = (fill_price / 100.0) * size
-                        payout = 1.0 * size if is_yes_result else 0.0
-                        pnl_before_fee = payout - cost
-                    elif side == 'sell':
-                        # Sold YES contracts (went short)
-                        revenue = (fill_price / 100.0) * size
-                        cost = 1.0 * size if is_yes_result else 0.0
-                        pnl_before_fee = revenue - cost
-                    else:
-                        pnl_before_fee = 0.0
-                    
-                    # Deduct Kalshi fee
-                    fee = calculate_fee(fill_price, size)
-                    realized_pnl = pnl_before_fee - fee
-                    
-                    # Update database
-                    self.trade_logger.log_position_closed(
-                        trade_id=trade_id,
-                        realized_pnl=realized_pnl
-                    )
-                    
-                    # Update portfolio (set position to 0 for this ticker)
-                    if ticker in self.portfolio.positions:
-                        current_pos = self.portfolio.positions[ticker]
-                        # Adjust position based on this trade
-                        if side == 'buy':
-                            self.portfolio.positions[ticker] = current_pos - size
-                        else:
-                            self.portfolio.positions[ticker] = current_pos + size
-                        
-                        # If position is now 0, remove it
-                        if self.portfolio.positions[ticker] == 0:
-                            del self.portfolio.positions[ticker]
-                            if ticker in self.portfolio.cost_basis:
-                                del self.portfolio.cost_basis[ticker]
-                    
-                    settled_count += 1
-                    
-                    print(f"\n{'='*50}")
-                    print(f"🏁 SETTLED: {ticker}")
-                    print(f"   Trade: {size} @ {fill_price:.1f}¢ ({side})")
-                    print(f"   Result: {result.upper()}")
-                    print(f"   P&L: ${pnl_before_fee:+.2f}")
-                    print(f"   Fee: -${fee:.2f}")
-                    print(f"   Net: ${realized_pnl:+.2f}")
-                    print(f"{'='*50}\n")
-            
-            except Exception as e:
-                # Don't crash the main loop on settlement errors
-                print(f"⚠️  Error checking settlement for {ticker}: {e}")
-                continue
-        
-        if settled_count > 0:
-            print(f"✅ Settled {settled_count} trades")
+        # Re-sync positions from Kalshi to catch any settlements we missed
+        # This ensures our exposure calculation matches Kalshi's actual state
+        self.portfolio.sync_positions(self.kalshi)
     
 
 
@@ -860,8 +783,8 @@ def main():
     
     # Configuration
     DRY_RUN = False  # SET TO FALSE FOR REAL TRADING!
-    MAX_EXPOSURE = 20.0
-    MAX_GAME_EXPOSURE = 5.0
+    MAX_EXPOSURE = 40.0
+    MAX_GAME_EXPOSURE = 7.0
     UPDATE_INTERVAL = 15
     
     # Initialize and run

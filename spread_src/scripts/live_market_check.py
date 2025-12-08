@@ -13,7 +13,7 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from src.data.kalshi import KalshiClient
+from data.kalshi import KalshiClient
 from spread_src.data.spread_markets import parse_spread_ticker, SpreadMarket, check_spread_arbitrage
 from spread_src.models.spread_model import SpreadDistributionModel
 import joblib

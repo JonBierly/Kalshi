@@ -8,7 +8,7 @@ import time
 import pandas as pd
 from datetime import datetime
 from src.inference.orchestrator import LiveGameOrchestrator
-from src.data.kalshi import KalshiClient
+from data.kalshi import KalshiClient
 from spread_src.data.spread_markets import parse_spread_ticker, SpreadMarket, check_spread_arbitrage
 from spread_src.models.spread_model import SpreadDistributionModel
 import joblib

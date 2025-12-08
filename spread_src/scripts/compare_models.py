@@ -26,7 +26,7 @@ from scipy import stats
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from src.models.training import prepare_training_data
-from src.data.database import DatabaseManager
+from data.database import DatabaseManager
 from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
 
 

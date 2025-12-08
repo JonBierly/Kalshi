@@ -11,43 +11,231 @@ from spread_src.execution.trade_logger import TradeLogger
 
 class Portfolio:
     """
-    Tracks portfolio state for market maker.
+    Stateless portfolio query layer for market maker.
     
-    State:
-    - Positions: {ticker: contracts} (+ long, - short)
-    - Cash: Available capital
-    - Exposure: Total $ at risk
-    - P&L: Realized + unrealized
+    Fetches all data from Kalshi on every query (no RAM caching).
+    This ensures data is always fresh and never stale.
     """
     
     def __init__(self, max_exposure=20.0, db_path='data/nba_data.db'):
         """
-        Initialize portfolio.
+        Initialize portfolio configuration.
         
         Args:
-            max_exposure: Maximum exposure limit in dollars (risk limit, not cash)
+            max_exposure: Maximum exposure limit in dollars (risk limit)
             db_path: Path to database for logging
         """
         self.max_exposure = max_exposure
-        self.cash = None  # Will be synced from Kalshi balance
-        
-        # Positions: ticker -> contracts (+ long, - short)
-        self.positions: Dict[str, int] = {}
-        
-        # Cost basis: ticker -> average cost per contract
-        self.cost_basis: Dict[str, float] = {}
-        
-        # Realized P&L (from closed positions)
-        self.realized_pnl = 0.0
-        
-        # Trade history
-        self.trade_history = []
-        
-        # Database logger
         self.logger = TradeLogger(db_path)
         
-        # Track trade_ids for fills
-        self.trade_ids: Dict[str, int] = {}  # ticker -> trade_id
+        # Temporary cache (refreshed each iteration from Kalshi)
+        self.positions: Dict[str, int] = {}
+        self.cost_basis: Dict[str, float] = {}
+        self.cash = None
+        self.realized_pnl = 0.0
+        
+        # Track trade_ids for fills (maps ticker to database trade_id)
+        self.trade_ids: Dict[str, int] = {}
+        
+        # Trade history (for logging)
+        self.trade_history = []
+    
+    def get_live_state(self, kalshi_client):
+        """
+        Fetch current portfolio state from Kalshi (no caching).
+        
+        Returns fresh data on every call to avoid stale state.
+        
+        Args:
+            kalshi_client: KalshiClient instance
+            
+        Returns:
+            {
+                'balance': float,  # Current cash balance
+                'positions': {ticker: count},  # Net positions
+                'cost_basis': {ticker: avg_price},  # Cost per contract
+                'exposure': float,  # Total $ at risk
+                'available_capital': float  # Balance - margin
+            }
+        """
+        # Fetch balance
+        balance_data = kalshi_client.get_balance()
+        balance = balance_data['balance'] if balance_data else self.max_exposure
+        
+        # Fetch unsettled positions
+        response = kalshi_client.get_positions(settlement_status='unsettled', limit=1000)
+        market_positions = response.get('market_positions', [])
+        
+        positions = {}
+        cost_basis = {}
+        
+        # Get fill history for cost basis calculation
+        fills_response = kalshi_client.get_fills(limit=1000)
+        fills = fills_response if isinstance(fills_response, list) else []
+        
+        # Group fills by ticker
+        fills_by_ticker = {}
+        for fill in fills:
+            ticker = fill.get('ticker')
+            if ticker:
+                if ticker not in fills_by_ticker:
+                    fills_by_ticker[ticker] = []
+                fills_by_ticker[ticker].append(fill)
+        
+        # Parse positions and calculate cost basis
+        for pos_data in market_positions:
+            ticker = pos_data.get('ticker')
+            position = pos_data.get('position', 0)
+            
+            if position == 0:
+                continue
+                
+            positions[ticker] = position
+            
+            # Try to calculate cost basis from fills (most accurate)
+            if ticker in fills_by_ticker:
+                ticker_fills = fills_by_ticker[ticker]
+                ticker_fills.sort(key=lambda x: x.get('created_time', ''))
+                
+                # Calculate weighted average cost
+                total_cost = 0
+                total_contracts = 0
+                
+                for fill in ticker_fills:
+                    side = fill.get('side', '').lower()
+                    price = fill.get('yes_price', 50)  # Price in cents
+                    count = fill.get('count', 0)  # Number of contracts
+                    
+                    if side in ['yes', 'no']:
+                        total_cost += price * count
+                        total_contracts += count
+                
+                if total_contracts > 0:
+                    cost_basis[ticker] = total_cost / total_contracts
+                else:
+                    cost_basis[ticker] = 50.0
+            else:
+                # Fallback: try total_cost from position data
+                total_cost_cents = pos_data.get('total_cost', 0)
+                if total_cost_cents != 0:
+                    cost_basis[ticker] = abs(total_cost_cents) / abs(position)
+                else:
+                    cost_basis[ticker] = 50.0
+        
+        # Calculate exposure
+        exposure = self._calculate_exposure_from_state(positions, cost_basis)
+        
+        # Calculate available capital (balance - margin held for shorts)
+        margin_held = 0.0
+        for ticker, pos in positions.items():
+            if pos < 0:  # Short position
+                margin_held += abs(pos) * 1.00  # $1 per contract margin
+        
+        available = balance - margin_held
+        
+        return {
+            'balance': balance,
+            'positions': positions,
+            'cost_basis': cost_basis,
+            'exposure': exposure,
+            'available_capital': max(0.0, available)
+        }
+    
+    def _calculate_exposure_from_state(self, positions: dict, cost_basis: dict) -> float:
+        """
+        Calculate total exposure from position state.
+        
+        Args:
+            positions: {ticker: count}
+            cost_basis: {ticker: avg_price_cents}
+            
+        Returns:
+            Total exposure in dollars
+        """
+        exposure = 0.0
+        
+        for ticker, position in positions.items():
+            if position == 0:
+                continue
+            
+            cost = cost_basis.get(ticker, 50.0)
+            
+            if position > 0:  # Long
+                exposure += (cost / 100.0) * position
+            else:  # Short
+                exposure += ((100 - cost) / 100.0) * abs(position)
+        
+        return exposure
+    
+    def refresh_state(self, kalshi_client):
+        """
+        Refresh cached state from Kalshi.
+        
+        Call this at the START of each trading iteration to ensure
+        all data is fresh. State is then cached for the iteration.
+        
+        Args:
+            kalshi_client: KalshiClient instance
+        """
+        state = self.get_live_state(kalshi_client)
+        
+        # Update cache
+        self.cash = state['balance']
+        self.positions = state['positions']
+        self.cost_basis = state['cost_basis']
+        
+        # Calculate realized P&L from Kalshi
+        self.realized_pnl = self.get_realized_pnl(kalshi_client)
+        
+        print(f"\n💰 Refreshed state from Kalshi")
+        print(f"  Cash: ${self.cash:.2f}")
+        print(f"  Positions: {len(self.positions)}")
+        print(f"  Exposure: ${state['exposure']:.2f}")
+        print(f"  Realized P&L: ${self.realized_pnl:+.2f}")
+    
+    def get_realized_pnl(self, kalshi_client, since_timestamp=None):
+        """
+        Calculate realized P&L from Kalshi settled positions.
+        
+        Args:
+            kalshi_client: KalshiClient instance
+            since_timestamp: Optional start time (default: today 4am)
+            
+        Returns:
+            Total realized P&L in dollars
+        """
+        if not since_timestamp:
+            # Default to today 4am
+            from datetime import datetime, timedelta
+            now = datetime.now()
+            if now.hour < 4:
+                start = (now - timedelta(days=1)).replace(hour=4, minute=0, second=0, microsecond=0)
+            else:
+                start = now.replace(hour=4, minute=0, second=0, microsecond=0)
+            since_timestamp = int(start.timestamp() * 1000)  # Kalshi uses milliseconds
+        
+        try:
+            # Fetch settled positions since timestamp
+            response = kalshi_client.get_positions(
+                settlement_status='settled',
+                limit=1000
+            )
+            
+            total_pnl = 0.0
+            for pos in response.get('market_positions', []):
+                # Check if within time range
+                settled_time = pos.get('settled_time')
+                # For now, include all settled positions
+                # TODO: filter by timestamp when API supports it
+                
+                # Kalshi provides realized_pnl in cents
+                real_pnl = pos.get('realized_pnl', 0)  # In cents
+                total_pnl += real_pnl / 100.0  # Convert to dollars
+            
+            return total_pnl
+        except Exception as e:
+            print(f"  ⚠️  Error calculating realized P&L: {e}")
+            return 0.0
     
     def update_fill(self, ticker: str, side: str, price: float, size: int, timestamp=None, trade_id=None):
         """

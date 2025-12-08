@@ -7,7 +7,7 @@ import sys
 import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from src.data.kalshi import KalshiClient
+from data.kalshi import KalshiClient
 import json
 from datetime import datetime
 

@@ -23,7 +23,7 @@ from spread_src.trading.market_evaluator import MarketEvaluator
 from spread_src.execution.trade_logger import TradeLogger
 from spread_src.models.spread_model import SpreadDistributionModel
 from spread_src.inference.spread_tracker import SpreadTracker
-from src.data.kalshi import KalshiClient
+from data.kalshi import KalshiClient
 import joblib
 
 
@@ -79,9 +79,8 @@ class LiveMarketMaker:
         self.risk_mgr = RiskManager(max_exposure, max_game_exposure)
         self.portfolio = Portfolio(max_exposure=max_exposure)
         
-        # Sync with actual Kalshi account
-        self.portfolio.sync_balance(self.kalshi)  # Get real cash balance
-        self.portfolio.sync_positions(self.kalshi)  # Get positions
+        # Sync with actual Kalshi account - fetch fresh state
+        self.portfolio.refresh_state(self.kalshi)
         
         # CRITICAL: Build game_tickers map from synced positions
         # Format: {game_id: [ticker1, ticker2, ...]}
@@ -161,7 +160,10 @@ class LiveMarketMaker:
                 print(f"Iteration {iteration} @ {datetime.now().strftime('%H:%M:%S')}")
                 print(f"{'=' * 80}\n")
                 
-                # Step 1: Check for fills
+                # Step 1: Refresh state from Kalshi (ensures fresh data)
+                self.portfolio.refresh_state(self.kalshi)
+                
+                # Step 2: Check for fills
                 fills = self.order_mgr.check_for_fills()
                 for fill in fills:
                     # Get trade_id if we have it
@@ -266,8 +268,7 @@ class LiveMarketMaker:
                 
 
                 
-                # Step 5: Check for settled positions
-                self._check_and_settle_positions()
+                # (State already refreshed at iteration start)
                 
                 # Step 6: Display status
                 self._print_enhanced_position_summary()

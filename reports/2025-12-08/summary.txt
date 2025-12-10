@@ -1,0 +1,27 @@
+============================================================
+DAILY PERFORMANCE REPORT: 2025-12-08
+Generated: 2025-12-10 16:54:08
+============================================================
+
+📊 OVERALL STATISTICS
+----------------------------------------
+Total Orders Placed: 1025
+Total Fills: 0
+Fill Rate: 0.0%
+Realized P&L: $-0.28
+Fees Paid: $1.39
+Net P&L: $-1.67
+
+🔍 KEY FINDINGS
+----------------------------------------
+
+📁 FILES GENERATED
+----------------------------------------
+• time_analysis.png
+• spread_analysis.png
+• liquidity_analysis.png
+• edge_analysis.png
+• spread_line_analysis.png
+• position_breakdown.png
+• full_trades.csv
+• summary.txt

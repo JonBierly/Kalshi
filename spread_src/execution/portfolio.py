@@ -34,9 +34,6 @@ class Portfolio:
         self.cash = None
         self.realized_pnl = 0.0
         
-        # Track trade_ids for fills (maps ticker to database trade_id)
-        self.trade_ids: Dict[str, int] = {}
-        
         # Trade history (for logging)
         self.trade_history = []
     

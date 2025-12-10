@@ -59,6 +59,9 @@ class TradeLogger:
                 realized_pnl REAL,
                 status TEXT,
                 
+                -- Kalshi order tracking
+                kalshi_order_id TEXT,
+                
                 -- Metadata
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 filled_at DATETIME,
@@ -145,10 +148,14 @@ class TradeLogger:
         ci_upper: Optional[float] = None,
         market_spread: Optional[float] = None,
         seconds_remaining: Optional[int] = None,
-        position_before: int = 0
+        position_before: int = 0,
+        kalshi_order_id: Optional[str] = None
     ) -> int:
         """
         Log order placement.
+        
+        Args:
+            kalshi_order_id: Order ID returned from Kalshi API
         
         Returns:
             trade_id for this order
@@ -161,16 +168,39 @@ class TradeLogger:
                 ticker, game_id, side, order_price, size,
                 model_fair_value, model_ci_lower, model_ci_upper,
                 market_spread, seconds_remaining, position_before,
-                status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed')
+                status, kalshi_order_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed', ?)
         ''', (ticker, game_id, side, price, size, model_fair, ci_lower, ci_upper,
-              market_spread, seconds_remaining, position_before))
+              market_spread, seconds_remaining, position_before, kalshi_order_id))
         
         trade_id = cursor.lastrowid
         conn.commit()
         conn.close()
         
         return trade_id
+    
+    def get_trade_id_by_order_id(self, kalshi_order_id: str) -> Optional[int]:
+        """
+        Look up trade_id by Kalshi order_id.
+        
+        Args:
+            kalshi_order_id: Order ID from Kalshi API
+        
+        Returns:
+            trade_id if found, None otherwise
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        cursor.execute('''
+            SELECT trade_id FROM trades
+            WHERE kalshi_order_id = ?
+        ''', (kalshi_order_id,))
+        
+        result = cursor.fetchone()
+        conn.close()
+        
+        return result[0] if result else None
     
     def log_order_filled(
         self,

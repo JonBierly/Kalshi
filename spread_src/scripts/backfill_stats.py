@@ -56,4 +56,4 @@ def backfill_advanced_stats(season="2025-26", limit=None):
 
 if __name__ == "__main__":
     # Run for 2024-25 season
-    backfill_advanced_stats(season='2025-26', limit=None)
+    backfill_advanced_stats(season='2023-24', limit=None)

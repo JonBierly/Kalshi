@@ -166,8 +166,8 @@ class LiveMarketMaker:
                 # Step 2: Check for fills
                 fills = self.order_mgr.check_for_fills()
                 for fill in fills:
-                    # Get trade_id if we have it
-                    trade_id = self.portfolio.trade_ids.get(fill.ticker)
+                    # Look up trade_id from database using order_id
+                    trade_id = self.trade_logger.get_trade_id_by_order_id(fill.order_id)
                     
                     # Update portfolio (which auto-logs to DB if trade_id provided)
                     self.portfolio.update_fill(
@@ -219,7 +219,7 @@ class LiveMarketMaker:
                             # Cancel if game has < 2 minutes
                             if order_game_time is not None and order_game_time < 120:
                                 print(f"  {order.order_id}: Late game ({order_game_time}s left), canceling")
-                                self.order_mgr.cancel_order(order.order_id)
+                                self._cancel_order_with_logging(order.order_id)
                                 continue
 
                         
@@ -233,7 +233,7 @@ class LiveMarketMaker:
                         if current_opp is None:
                             # No longer want to quote this ticker+side
                             print(f"  {order.order_id}: No longer quoting, canceling")
-                            self.order_mgr.cancel_order(order.order_id)
+                            self._cancel_order_with_logging(order.order_id)
                             continue
                         
                         # Check if our order is still competitive
@@ -245,7 +245,7 @@ class LiveMarketMaker:
                         else:
                             # Price moved significantly - cancel and replace
                             print(f"  {order.order_id}: Price changed by {price_diff:.1f}¢, canceling")
-                            self.order_mgr.cancel_order(order.order_id)
+                            self._cancel_order_with_logging(order.order_id)
                 
                 
                 # Step 4: Per-game order management and placement
@@ -281,6 +281,11 @@ class LiveMarketMaker:
         except KeyboardInterrupt:
             print("\n\nStopping market maker...")
             self.order_mgr.cancel_all_orders()
+            
+            # Settle any finalized markets before exiting
+            print("\n🔍 Checking for settled markets...")
+            self._check_and_settle_positions()
+            
             self._print_enhanced_position_summary()
             print("\n✓ Shutdown complete")
     
@@ -584,7 +589,7 @@ class LiveMarketMaker:
             open_orders: All currently open orders
         """
         EV_THRESHOLD_OPENING = 5.0  # Minimum 5¢ EV for new positions
-        EV_THRESHOLD_CLOSING = 0.0  # Minimum 2¢ EV for closing positions (lower to reduce risk)
+        EV_THRESHOLD_CLOSING = 2.0  # Minimum 2¢ EV for closing positions (lower to reduce risk)
         
         # Filter opportunities by EV threshold (checking if closing or opening)
         good_opps = []
@@ -751,13 +756,28 @@ class LiveMarketMaker:
                 ci_upper=opp.get('ci_upper'),
                 market_spread=opp.get('market_spread'),
                 seconds_remaining=opp.get('seconds_remaining'),
-                position_before=self.portfolio.positions.get(opp['ticker'], 0)
+                position_before=self.portfolio.positions.get(opp['ticker'], 0),
+                kalshi_order_id=order_id  # Stored in DB for later lookup
             )
-            # Store trade_id for later fill logging
-            self.portfolio.trade_ids[opp['ticker']] = trade_id
+            # No RAM dict needed - kalshi_order_id in DB enables lookup
 
         else:
             print(f"  ✗ Order failed")
+    
+    def _cancel_order_with_logging(self, order_id: str):
+        """
+        Cancel order and log cancellation to database.
+        
+        Args:
+            order_id: Kalshi order ID to cancel
+        """
+        # Cancel via order manager
+        self.order_mgr.cancel_order(order_id)
+        
+        # Look up trade_id from database and log cancellation
+        trade_id = self.trade_logger.get_trade_id_by_order_id(order_id)
+        if trade_id:
+            self.trade_logger.log_order_canceled(trade_id)
     
     
     def _check_and_settle_positions(self):
@@ -784,8 +804,8 @@ def main():
     
     # Configuration
     DRY_RUN = False  # SET TO FALSE FOR REAL TRADING!
-    MAX_EXPOSURE = 40.0
-    MAX_GAME_EXPOSURE = 7.0
+    MAX_EXPOSURE = 20.0
+    MAX_GAME_EXPOSURE = 10.0
     UPDATE_INTERVAL = 15
     
     # Initialize and run

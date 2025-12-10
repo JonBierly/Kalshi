@@ -342,6 +342,9 @@ class DatabaseManager:
                 print(f"Player stats for game {game_id} already exist. Skipping.")
                 return
 
+            # Deduplicate by player_id to prevent UNIQUE constraint errors
+            stats_df = stats_df.drop_duplicates(subset=['personId'], keep='first')
+
             stats_objects = []
             for _, row in stats_df.iterrows():
                 pid = row.get('personId', 0)

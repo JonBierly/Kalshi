@@ -41,4 +41,4 @@ def backfill_team_logs(season='2025-26'):
 
 if __name__ == "__main__":
     # You can change the season here
-    backfill_team_logs(season='2025-26')
+    backfill_team_logs(season='2023-24')

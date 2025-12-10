@@ -26,11 +26,12 @@ class Order:
 class Fill:
     """Represents a filled order."""
     
-    def __init__(self, ticker: str, side: str, price: float, size: int):
+    def __init__(self, ticker: str, side: str, price: float, size: int, order_id: str = None):
         self.ticker = ticker
         self.side = side
         self.price = price
         self.size = size
+        self.order_id = order_id  # Kalshi order ID for matching to database
         self.timestamp = datetime.now()
 
 
@@ -383,12 +384,13 @@ class OrderManager:
                         order.filled_at = datetime.now()
                         order.filled_size = fill.get('count', 0)
                         
-                        # Create fill object
+                        # Create fill object with order_id for database matching
                         fill_obj = Fill(
                             ticker=fill.get('ticker'),
                             side=fill.get('action'),  # 'buy' or 'sell'
                             price=fill.get('yes_price', fill.get('no_price', 0)),
-                            size=fill.get('count', 0)
+                            size=fill.get('count', 0),
+                            order_id=order_id  # Include order_id for trade lookup
                         )
                         
                         self.fills.append(fill_obj)

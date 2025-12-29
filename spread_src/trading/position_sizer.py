@@ -22,22 +22,29 @@ class PositionSizer:
         self,
         fair_value: float,
         price: float,
-        ci_width: float,
         bankroll: float,
+        action: str = 'buy',
+        ci_lower: float = None,
+        ci_upper: float = None,
         position: int = 0,
         min_size: int = 1,
         max_size: int = 10
     ) -> int:
         """
-        Calculate Kelly-optimal position size.
+        Calculate Kelly-optimal position size using conservative CI bounds.
         
-        Formula: f = (edge / price) × kelly_fraction
+        Formula: f = (conservative_edge / price) × kelly_fraction
+        
+        For BUYS: conservative_edge = ci_lower - price (worst case: true prob is low)
+        For SELLS: conservative_edge = price - ci_upper (worst case: true prob is high)
         
         Args:
             fair_value: Model prediction in cents (0-100)
             price: Order price in cents
-            ci_width: Confidence interval width (0-1)
             bankroll: Available capital in dollars
+            action: 'buy' or 'sell'
+            ci_lower: 90% CI lower bound (0-1), or None to use fair_value
+            ci_upper: 90% CI upper bound (0-1), or None to use fair_value
             position: Current position
             min_size: Minimum contract size
             max_size: Maximum contract size
@@ -45,8 +52,25 @@ class PositionSizer:
         Returns:
             Number of contracts (min_size to max_size)
         """
-        # Edge in cents
-        edge = abs(fair_value - price)
+        # Use conservative CI bound based on action
+        # BUY: worst case is true prob at ci_lower
+        # SELL: worst case is true prob at ci_upper
+        if action == 'buy':
+            conservative_fair = (ci_lower * 100) if ci_lower is not None else fair_value
+            edge = conservative_fair - price  # positive if we have edge
+        else:  # sell
+            conservative_fair = (ci_upper * 100) if ci_upper is not None else fair_value
+            edge = price - conservative_fair  # positive if we have edge
+        
+        # Calculate CI width for uncertainty adjustment
+        if ci_lower is not None and ci_upper is not None:
+            ci_width = ci_upper - ci_lower
+        else:
+            ci_width = 0.15  # fallback default
+        
+        # No edge on conservative basis = min size
+        if edge <= 0:
+            return min_size
         
         # Avoid division issues
         if price < 1 or price > 99 or bankroll < 0.10:

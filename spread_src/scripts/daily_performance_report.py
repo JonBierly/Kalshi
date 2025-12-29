@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from datetime import datetime, timedelta
 from pathlib import Path
+import pytz
 
 # Add parent directory for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
@@ -51,13 +52,14 @@ def parse_args():
 
 
 def load_trades_from_db(date_str):
-    """Load trades from local database for a specific date."""
+    """Load trades from local database for a specific game date."""
     if not os.path.exists(DB_PATH):
         print(f"❌ Database not found at {DB_PATH}")
         return pd.DataFrame()
     
     conn = sqlite3.connect(DB_PATH)
     
+    # Load all trades, we'll filter by game_date after parsing
     query = """
         SELECT 
             trade_id, timestamp, ticker, game_id, side,
@@ -68,26 +70,37 @@ def load_trades_from_db(date_str):
             realized_pnl, status,
             created_at, filled_at, closed_at
         FROM trades
-        WHERE DATE(created_at) = ?
         ORDER BY created_at
     """
     
-    df = pd.read_sql_query(query, conn, params=[date_str])
+    df = pd.read_sql_query(query, conn)
     conn.close()
     
-    if not df.empty:
-        df['created_at'] = pd.to_datetime(df['created_at'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        
-        # Derived fields
-        df['edge'] = abs(df['model_fair_value'] - df['order_price'])
-        df['edge_pct'] = df['edge'] / df['order_price'] * 100
-        df['ci_width'] = df['model_ci_upper'] - df['model_ci_lower']
-        df['mins_remaining'] = df['seconds_remaining'] / 60.0
-        
-        # Extract spread line from ticker
-        df['spread_line'] = df['ticker'].apply(extract_spread_line)
-        df['matchup'] = df['ticker'].apply(extract_matchup)
+    if df.empty:
+        return df
+    
+    df['created_at'] = pd.to_datetime(df['created_at'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    # Extract game date from game_id (e.g., 25DEC12BOS -> 2025-12-12)
+    df['game_date'] = df['game_id'].apply(extract_game_date)
+    
+    # Filter by game date
+    target_date = datetime.strptime(date_str, '%Y-%m-%d').date()
+    df = df[df['game_date'] == target_date]
+    
+    if df.empty:
+        return df
+    
+    # Derived fields
+    # Edge = difference between model fair value and fill price (in cents)
+    df['edge'] = abs(df['model_fair_value'] - df['fill_price'])
+    df['ci_width'] = df['model_ci_upper'] - df['model_ci_lower']
+    df['mins_remaining'] = df['seconds_remaining'] / 60.0
+    
+    # Extract spread line from ticker
+    df['spread_line'] = df['ticker'].apply(extract_spread_line)
+    df['matchup'] = df['ticker'].apply(extract_matchup)
     
     return df
 
@@ -112,14 +125,55 @@ def extract_matchup(ticker):
     return None
 
 
-def load_fills_from_api(client, date_str):
-    """Load fills from Kalshi API for a specific date."""
-    target_date = datetime.strptime(date_str, '%Y-%m-%d')
-    start_dt = target_date
-    end_dt = target_date + timedelta(days=1)
+def extract_game_date(game_id):
+    """Extract actual game date from game_id (e.g., 25DEC11BOS -> 2025-12-11)."""
+    if not game_id:
+        return None
+    try:
+        # game_id format: 25DEC11BOS (YYMMMDD + team code)
+        date_part = game_id[:7]
+        year = 2000 + int(date_part[:2])  # 25 -> 2025
+        month_str = date_part[2:5]  # DEC
+        day = int(date_part[5:7])  # 11
+        
+        months = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                  'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+        month = months.get(month_str.upper(), 1)
+        
+        return datetime(year, month, day).date()
+    except:
+        return None
+
+
+def get_game_day_time_range(date_str):
+    """
+    Get timestamp range for a game day.
     
-    min_ts = int(start_dt.timestamp() * 1000)
-    max_ts = int(end_dt.timestamp() * 1000)
+    NBA games for a given date run from ~afternoon to late night,
+    with West Coast games potentially settling after midnight.
+    
+    Time window: 10am target date to 4am next date (Eastern time)
+    """
+    eastern = pytz.timezone('US/Eastern')
+    target_date = datetime.strptime(date_str, '%Y-%m-%d')
+    
+    # Start: 10am Eastern on target date
+    start_dt = eastern.localize(datetime(target_date.year, target_date.month, target_date.day, 10, 0, 0))
+    
+    # End: 4am Eastern on next day
+    next_date = target_date + timedelta(days=1)
+    end_dt = eastern.localize(datetime(next_date.year, next_date.month, next_date.day, 4, 0, 0))
+    
+    # Convert to UTC timestamps in milliseconds
+    min_ts = int(start_dt.astimezone(pytz.utc).timestamp() * 1000)
+    max_ts = int(end_dt.astimezone(pytz.utc).timestamp() * 1000)
+    
+    return min_ts, max_ts
+
+
+def load_fills_from_api(client, date_str):
+    """Load fills from Kalshi API for a specific game day."""
+    min_ts, max_ts = get_game_day_time_range(date_str)
     
     fills = client.get_fills(min_ts=min_ts, max_ts=max_ts, limit=1000)
     
@@ -133,15 +187,21 @@ def load_fills_from_api(client, date_str):
             dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
         else:
             continue
+        
+        side = fill.get('side')
+        yes_price = fill.get('yes_price', 0)
+        no_price = fill.get('no_price', 0)
+        price = yes_price if side == 'yes' else no_price
             
         fill_data.append({
             'fill_time': dt,
             'ticker': fill.get('ticker'),
-            'side': fill.get('side'),
+            'side': side,
             'action': fill.get('action'),
             'count': fill.get('count', 0),
-            'yes_price': fill.get('yes_price', 0),
-            'no_price': fill.get('no_price', 0),
+            'yes_price': yes_price,
+            'no_price': no_price,
+            'price': price,
             'is_taker': fill.get('is_taker', False),
         })
     
@@ -149,50 +209,121 @@ def load_fills_from_api(client, date_str):
 
 
 def load_settled_positions(client, date_str):
-    """Load settled positions for markets from the target date."""
-    settled = client.get_positions(settlement_status='settled', limit=1000)
-    positions = settled.get('market_positions', [])
+    """Load settlements for markets from the target game day."""
+    min_ts, max_ts = get_game_day_time_range(date_str)
     
-    # Filter to NBA spread markets for this date
-    date_code = datetime.strptime(date_str, '%Y-%m-%d').strftime('%y%b%d').upper()
+    # Fetch settlements from Kalshi API
+    settlements = client.get_settlements(min_ts=min_ts, max_ts=max_ts, limit=200)
     
+    # Filter to NBA spread markets and calculate CORRECT P&L
     result = []
-    for pos in positions:
-        ticker = pos.get('ticker', '')
-        if f'-{date_code}' in ticker and 'KXNBASPREAD' in ticker:
+    for s in settlements:
+        ticker = s.get('ticker', '')
+        if 'KXNBASPREAD' in ticker:
+            yes_count = s.get('yes_count', 0)
+            no_count = s.get('no_count', 0)
+            yes_cost = s.get('yes_total_cost', 0)  # in cents
+            no_cost = s.get('no_total_cost', 0)    # in cents
+            market_result = s.get('market_result', '')
+            fees = float(s.get('fee_cost', '0'))
+            
+            # CORRECT P&L FORMULA:
+            # Payout = winning_side_count × 100 cents
+            # P&L = (payout - total_costs) / 100 - fees
+            if market_result == 'yes':
+                payout_cents = yes_count * 100
+            else:  # 'no'
+                payout_cents = no_count * 100
+            
+            pnl_cents = payout_cents - yes_cost - no_cost
+            pnl_dollars = pnl_cents / 100.0 - fees
+            
             result.append({
                 'ticker': ticker,
-                'realized_pnl': pos.get('realized_pnl', 0) / 100.0,
-                'fees_paid': pos.get('fees_paid', 0) / 100.0,
-                'total_traded': pos.get('total_traded', 0),
+                'event_ticker': s.get('event_ticker', ''),
+                'market_result': market_result,
+                'yes_count': yes_count,
+                'no_count': no_count,
+                'yes_cost': yes_cost / 100.0,
+                'no_cost': no_cost / 100.0,
+                'payout': payout_cents / 100.0,
+                'realized_pnl': pnl_dollars,
+                'fees_paid': fees,
+                'settled_time': s.get('settled_time', ''),
             })
     
     return pd.DataFrame(result)
 
 
 # ============================================================================
+# UNIFIED P&L CALCULATION
+# ============================================================================
+
+def calculate_true_pnl(settled_df):
+    """
+    Calculate true P&L using settlement data as the SINGLE SOURCE OF TRUTH.
+    
+    The settlement API provides complete P&L for every ticker you traded,
+    including positions you fully closed out (they show yes_count=0, no_count=0
+    but still have cost data that reflects your trading activity).
+    
+    P&L formula (already calculated in load_settled_positions):
+        payout = winning_side_count × 100 cents
+        pnl = (payout - yes_cost - no_cost) / 100 - fees
+    
+    Returns:
+        dict with:
+        - 'ticker_pnl': {ticker: pnl} dict
+        - 'total_pnl': float (sum of all ticker P&L)
+        - 'total_fees': float (sum of all fees)
+    """
+    if settled_df.empty:
+        return {'ticker_pnl': {}, 'total_pnl': 0.0, 'total_fees': 0.0}
+    
+    # Build ticker P&L lookup from settlement data
+    ticker_pnl = {}
+    total_fees = 0.0
+    
+    for _, row in settled_df.iterrows():
+        ticker = row['ticker']
+        pnl = row['realized_pnl']  # Already correct from load_settled_positions
+        fees = row['fees_paid']
+        
+        ticker_pnl[ticker] = pnl
+        total_fees += fees
+    
+    total_pnl = sum(ticker_pnl.values())
+    
+    return {
+        'ticker_pnl': ticker_pnl,
+        'total_pnl': total_pnl,
+        'total_fees': total_fees
+    }
+
+
+# ============================================================================
 # DATA ENRICHMENT FUNCTIONS
 # ============================================================================
 
-def distribute_pnl_to_trades(trades_df, settled_df):
+def distribute_pnl_to_trades(trades_df, ticker_pnl):
     """
-    Distribute position-level P&L to individual trades.
+    Distribute ticker-level P&L to individual trades proportionally.
     
-    Since the database doesn't have per-trade realized P&L, we distribute 
-    the position P&L proportionally based on trade size.
+    Args:
+        trades_df: DataFrame of trades from database
+        ticker_pnl: Dict of {ticker: realized_pnl} from calculate_true_pnl()
+    
+    Returns:
+        trades_df with realized_pnl column populated
     """
-    if settled_df.empty or trades_df.empty:
+    if trades_df.empty or not ticker_pnl:
         return trades_df
     
     # Get filled trades only
-    filled = trades_df[trades_df['status'].isin(['filled', 'settled'])].copy()
+    filled = trades_df[trades_df['status'].isin(['filled', 'settled', 'closed'])].copy()
     
-    # For each position, find trades that contributed to it
-    for _, pos in settled_df.iterrows():
-        ticker = pos['ticker']
-        position_pnl = pos['realized_pnl']
-        
-        # Find all trades for this ticker
+    # For each ticker, distribute P&L to trades proportionally by trade size
+    for ticker, pnl in ticker_pnl.items():
         mask = filled['ticker'] == ticker
         ticker_trades = filled[mask]
         
@@ -204,7 +335,7 @@ def distribute_pnl_to_trades(trades_df, settled_df):
         if total_size > 0:
             for idx in ticker_trades.index:
                 trade_size = filled.loc[idx, 'size']
-                trade_pnl = position_pnl * (trade_size / total_size)
+                trade_pnl = pnl * (trade_size / total_size)
                 trades_df.loc[trades_df['trade_id'] == filled.loc[idx, 'trade_id'], 'realized_pnl'] = trade_pnl
     
     return trades_df
@@ -219,17 +350,17 @@ def analyze_edge(df, output_dir):
     print("\n📊 Edge Analysis...")
     
     # Only use filled trades with realized P&L
-    filled = df[df['status'].isin(['filled', 'settled'])].copy()
+    filled = df[df['status'].isin(['filled', 'settled', 'closed'])].copy()
     
     if filled.empty:
         print("  No filled trades to analyze")
         return {}
     
-    # Create edge buckets
+    # Create edge buckets (in cents)
     filled['edge_bucket'] = pd.cut(
-        filled['edge_pct'],
-        bins=[0, 2, 5, 10, 100],
-        labels=['Thin (0-2%)', 'Medium (2-5%)', 'Fat (5-10%)', 'Huge (>10%)']
+        filled['edge'],
+        bins=[0, 5, 10, 15, 1000],
+        labels=['Small (0-5¢)', 'Medium (5-10¢)', 'Large (10-15¢)', 'Huge (>15¢)']
     )
     
     # Stats by bucket
@@ -273,7 +404,7 @@ def analyze_market_spread(df, output_dir):
     """Analyze market spread width vs performance."""
     print("\n📊 Market Spread Analysis...")
     
-    filled = df[df['status'].isin(['filled', 'settled'])].copy()
+    filled = df[df['status'].isin(['filled', 'settled', 'closed'])].copy()
     
     if filled.empty or filled['market_spread'].isna().all():
         print("  No market spread data available")
@@ -325,7 +456,7 @@ def analyze_time_remaining(df, output_dir):
     """Analyze performance by time remaining in game."""
     print("\n📊 Time Remaining Analysis...")
     
-    filled = df[df['status'].isin(['filled', 'settled'])].copy()
+    filled = df[df['status'].isin(['filled', 'settled', 'closed'])].copy()
     
     if filled.empty or filled['seconds_remaining'].isna().all():
         print("  No time data available")
@@ -422,7 +553,7 @@ def analyze_spread_lines(df, output_dir):
     """Analyze performance by spread line magnitude."""
     print("\n📊 Spread Line Analysis...")
     
-    filled = df[df['status'].isin(['filled', 'settled'])].copy()
+    filled = df[df['status'].isin(['filled', 'settled', 'closed'])].copy()
     filled = filled.dropna(subset=['spread_line'])
     
     if filled.empty:
@@ -472,19 +603,22 @@ def analyze_spread_lines(df, output_dir):
 
 
 def analyze_positions(df, settled_df, output_dir):
-    """Analyze what positions were held and their outcomes."""
-    print("\n📊 Position Analysis...")
+    """Analyze P&L by ticker using SETTLEMENT data (correct P&L source)."""
+    print("\n📊 Position Analysis (from settlements)...")
     
     if settled_df.empty:
-        print("  No settled position data available")
+        print("  No settlement data available")
         return {}
     
-    # Sort by P&L to show winners and losers
-    settled_df = settled_df.sort_values('realized_pnl')
+    # Use settlement data which has correct P&L
+    ticker_pnl = settled_df[['ticker', 'realized_pnl', 'yes_count', 'no_count']].copy()
+    ticker_pnl['contracts'] = ticker_pnl['yes_count'] + ticker_pnl['no_count']
+    ticker_pnl = ticker_pnl[['ticker', 'realized_pnl', 'contracts']]
+    ticker_pnl = ticker_pnl.sort_values('realized_pnl')
     
     # Separate losers and winners
-    losers = settled_df[settled_df['realized_pnl'] < 0]
-    winners = settled_df[settled_df['realized_pnl'] > 0]
+    losers = ticker_pnl[ticker_pnl['realized_pnl'] < 0]
+    winners = ticker_pnl[ticker_pnl['realized_pnl'] > 0]
     
     # Plot
     fig, axes = plt.subplots(1, 2, figsize=(16, 8))
@@ -516,26 +650,36 @@ def analyze_positions(df, settled_df, output_dir):
     
     # Summary stats
     summary = {
-        'total_positions': len(settled_df),
+        'total_tickers': len(ticker_pnl),
         'winners': len(winners),
         'losers': len(losers),
-        'total_pnl': settled_df['realized_pnl'].sum(),
-        'total_fees': settled_df['fees_paid'].sum(),
+        'total_pnl': ticker_pnl['realized_pnl'].sum(),
+        'total_contracts': ticker_pnl['contracts'].sum(),
         'avg_winner': winners['realized_pnl'].mean() if not winners.empty else 0,
         'avg_loser': losers['realized_pnl'].mean() if not losers.empty else 0,
     }
     
-    print(f"  Total Positions: {summary['total_positions']}")
+    print(f"  Total Tickers: {summary['total_tickers']}")
     print(f"  Winners: {summary['winners']} (avg ${summary['avg_winner']:.2f})")
     print(f"  Losers: {summary['losers']} (avg ${summary['avg_loser']:.2f})")
     print(f"  Total P&L: ${summary['total_pnl']:.2f}")
-    print(f"  Total Fees: ${summary['total_fees']:.2f}")
+    print(f"  Total Contracts: {summary['total_contracts']}")
     
     return summary
 
 
-def generate_summary(date_str, df, settled_df, analyses, output_dir):
-    """Generate text summary of findings."""
+def generate_summary(date_str, df, pnl_result, settled_df, analyses, output_dir):
+    """
+    Generate text summary of findings.
+    
+    Args:
+        date_str: Date string
+        df: Trades DataFrame
+        pnl_result: Dict from calculate_true_pnl() with total_pnl, trading_pnl, settlement_pnl
+        settled_df: Settlements DataFrame (for fees)
+        analyses: Dict of analysis results
+        output_dir: Output directory path
+    """
     summary_path = output_dir / 'summary.txt'
     
     with open(summary_path, 'w') as f:
@@ -549,16 +693,17 @@ def generate_summary(date_str, df, settled_df, analyses, output_dir):
         f.write("-" * 40 + "\n")
         f.write(f"Total Orders Placed: {len(df)}\n")
         
-        filled = df[df['status'].isin(['filled', 'settled'])]
+        filled = df[df['status'].isin(['filled', 'settled', 'closed'])]
         f.write(f"Total Fills: {len(filled)}\n")
         f.write(f"Fill Rate: {len(filled)/len(df)*100:.1f}%\n")
         
-        if not settled_df.empty:
-            total_pnl = settled_df['realized_pnl'].sum()
-            total_fees = settled_df['fees_paid'].sum()
-            f.write(f"Realized P&L: ${total_pnl:.2f}\n")
-            f.write(f"Fees Paid: ${total_fees:.2f}\n")
-            f.write(f"Net P&L: ${total_pnl - total_fees:.2f}\n")
+        # Use settlement-based P&L calculation (already includes fees)
+        total_pnl = pnl_result.get('total_pnl', 0.0)
+        total_fees = pnl_result.get('total_fees', 0.0)
+        num_tickers = len(pnl_result.get('ticker_pnl', {}))
+        
+        f.write(f"Total P&L: ${total_pnl:.2f} (net of ${total_fees:.2f} fees)\n")
+        f.write(f"Markets Traded: {num_tickers}\n")
         f.write("\n")
         
         # Key findings
@@ -626,9 +771,15 @@ def main():
     settled_df = load_settled_positions(client, date_str)
     print(f"  ✓ Loaded {len(settled_df)} settled positions for date")
     
-    # Distribute position-level P&L to individual trades
-    print("\n📊 Distributing P&L to trades...")
-    df = distribute_pnl_to_trades(df, settled_df)
+    # Calculate TRUE P&L using settlements as single source of truth
+    print("\n📊 Calculating TRUE P&L from settlements...")
+    pnl_result = calculate_true_pnl(settled_df)
+    print(f"  ✓ Total P&L: ${pnl_result['total_pnl']:.2f}")
+    print(f"  ✓ Total Fees: ${pnl_result['total_fees']:.2f}")
+    print(f"  ✓ Tickers: {len(pnl_result['ticker_pnl'])}")
+    
+    # Distribute P&L to individual trades for analysis charts
+    df = distribute_pnl_to_trades(df, pnl_result['ticker_pnl'])
     trades_with_pnl = df['realized_pnl'].notna().sum()
     print(f"  ✓ {trades_with_pnl} trades now have P&L attribution")
     
@@ -646,8 +797,8 @@ def main():
     analyses['spread_line'] = analyze_spread_lines(df, output_dir)
     analyses['positions'] = analyze_positions(df, settled_df, output_dir)
     
-    # Generate summary
-    generate_summary(date_str, df, settled_df, analyses, output_dir)
+    # Generate summary with unified P&L
+    generate_summary(date_str, df, pnl_result, settled_df, analyses, output_dir)
     
     print("\n" + "=" * 60)
     print("✅ REPORT COMPLETE")

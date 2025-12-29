@@ -1,11 +1,10 @@
 """
 Train XGBoost models for spread prediction.
 
-Predicts:
-- Mean: Expected score differential
-- Std: Uncertainty in differential
+Predicts SCORE REMAINDER (final_diff - current_diff), not static final diff.
+This prevents overfitting by predicting how much the margin will change.
 
-Uses XGBoost instead of Ridge for better accuracy.
+At inference: expected_final_diff = current_diff + predicted_remainder
 """
 
 import numpy as np
@@ -62,7 +61,12 @@ def train_xgboost_spread_models(n_models=10):
     X, y_binary = prepare_training_data()
     final_diffs = get_final_score_diffs(X)
     
-    print(f"Score diff stats: Mean={np.mean(final_diffs):.2f}, Std={np.std(final_diffs):.2f}")
+    # Compute Score Remainder target
+    current_diffs = X['score_diff'].values
+    score_remainders = final_diffs - current_diffs
+    
+    print(f"Final diff stats: Mean={np.mean(final_diffs):.2f}, Std={np.std(final_diffs):.2f}")
+    print(f"Score remainder stats (TARGET): Mean={np.mean(score_remainders):.2f}, Std={np.std(score_remainders):.2f}")
     
     # Split by game
     game_ids = X['game_id'].unique()
@@ -79,11 +83,14 @@ def train_xgboost_spread_models(n_models=10):
     
     X_train_features = X[train_mask][available_cols]
     X_test_features = X[test_mask][available_cols]
-    y_train_diffs = final_diffs[train_mask]
-    y_test_diffs = final_diffs[test_mask]
     
-    print(f"Training: {len(X_train_features)} events, {len(train_ids)} games")
-    print(f"Test: {len(X_test_features)} events, {len(test_ids)} games")
+    # Use score remainder as target
+    y_train_remainder = score_remainders[train_mask]
+    y_test_remainder = score_remainders[test_mask]
+    
+    # Keep for reconstruction
+    test_current_diffs = current_diffs[test_mask]
+    y_test_final_diffs = final_diffs[test_mask]
     
     # Train ensemble
     print(f"\nTraining {n_models} XGBoost model pairs...")
@@ -100,7 +107,7 @@ def train_xgboost_spread_models(n_models=10):
         boot_mask = X_train_game_ids.isin(boot_game_ids)
         
         X_boot = X_train_features[boot_mask]
-        y_boot = y_train_diffs[boot_mask]
+        y_boot = y_train_remainder[boot_mask]  # Score remainder target
         
         # Split for early stopping
         X_tr, X_val, y_tr, y_val = train_test_split(
@@ -138,7 +145,7 @@ def train_xgboost_spread_models(n_models=10):
         std_model = xgb.XGBRegressor(
             objective='reg:squarederror',
             n_estimators=500,
-            learning_rate=0.05,
+            learning_rate=0.1,
             max_depth=3,
             min_child_weight=2,
             subsample=0.8,
@@ -177,18 +184,29 @@ def train_xgboost_spread_models(n_models=10):
         test_mean_preds.append(mean_pred)
         test_std_preds.append(std_pred)
     
-    ensemble_mean = np.mean(test_mean_preds, axis=0)
+    ensemble_remainder_mean = np.mean(test_mean_preds, axis=0)
     ensemble_std = np.mean(test_std_preds, axis=0)
     
-    mae = mean_absolute_error(y_test_diffs, ensemble_mean)
-    rmse = np.sqrt(mean_squared_error(y_test_diffs, ensemble_mean))
+    # Reconstruct final diff
+    reconstructed_final_diff = test_current_diffs + ensemble_remainder_mean
     
-    print(f"\nMean Prediction:")
-    print(f"  MAE: {mae:.2f} points")
-    print(f"  RMSE: {rmse:.2f} points")
+    # Metrics on remainder
+    remainder_mae = mean_absolute_error(y_test_remainder, ensemble_remainder_mean)
+    remainder_rmse = np.sqrt(mean_squared_error(y_test_remainder, ensemble_remainder_mean))
+    
+    # Metrics on reconstructed final diff  
+    final_mae = mean_absolute_error(y_test_final_diffs, reconstructed_final_diff)
+    final_rmse = np.sqrt(mean_squared_error(y_test_final_diffs, reconstructed_final_diff))
+    
+    print(f"\nRemainder Prediction:")
+    print(f"  MAE: {remainder_mae:.2f} points")
+    print(f"  RMSE: {remainder_rmse:.2f} points")
+    print(f"\nReconstructed Final Diff:")
+    print(f"  MAE: {final_mae:.2f} points")
+    print(f"  RMSE: {final_rmse:.2f} points")
     print(f"\nStd Prediction:")
     print(f"  Mean predicted std: {np.mean(ensemble_std):.2f}")
-    print(f"  Actual std of errors: {np.std(y_test_diffs - ensemble_mean):.2f}")
+    print(f"  Actual std of errors: {np.std(y_test_remainder - ensemble_remainder_mean):.2f}")
     
     # Calibration
     from scipy import stats
@@ -200,13 +218,13 @@ def train_xgboost_spread_models(n_models=10):
     thresholds = [-10, -5, 0, 5, 10]
     for threshold in thresholds:
         pred_probs = []
-        for mean, std in zip(ensemble_mean, ensemble_std):
-            dist = stats.norm(loc=mean, scale=max(std, 1.0))
+        for recon_mean, std in zip(reconstructed_final_diff, ensemble_std):
+            dist = stats.norm(loc=recon_mean, scale=max(std, 1.0))
             prob = 1 - dist.cdf(threshold)
             pred_probs.append(prob)
         
         mean_pred = np.mean(pred_probs)
-        actual_freq = np.mean(y_test_diffs > threshold)
+        actual_freq = np.mean(y_test_final_diffs > threshold)
         
         print(f"P(diff > {threshold:+.0f}): Predicted {mean_pred:.1%}, Actual {actual_freq:.1%}")
     

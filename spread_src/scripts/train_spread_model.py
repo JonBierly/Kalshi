@@ -1,8 +1,11 @@
 """
 Train spread distribution models.
 
-Strategy: Predict distribution parameters (mean, std) of final score differential.
-Then use these to compute P(diff > threshold) for any threshold.
+Strategy: Predict the SCORE REMAINDER (final_diff - current_diff), not the static final diff.
+This prevents overfitting by making the model learn how much the score will change
+from the current game state, rather than a fixed outcome that's constant for all rows.
+
+At inference time: expected_final_diff = current_score_diff + predicted_remainder
 """
 
 import numpy as np
@@ -78,10 +81,17 @@ def train_spread_models(n_models=10):
     print("Getting final score differentials...")
     final_diffs = get_final_score_diffs(X)
     
-    print(f"Score diff stats:")
-    print(f"  Mean: {np.mean(final_diffs):.2f}")
-    print(f"  Std: {np.std(final_diffs):.2f}")
-    print(f"  Min: {np.min(final_diffs):.0f}, Max: {np.max(final_diffs):.0f}")
+    # 3. Compute Score Remainder target: how much will the margin change from here?
+    # This is the key change to prevent overfitting
+    current_diffs = X['score_diff'].values
+    score_remainders = final_diffs - current_diffs
+    
+    print(f"\nFinal diff stats (for reference):")
+    print(f"  Mean: {np.mean(final_diffs):.2f}, Std: {np.std(final_diffs):.2f}")
+    print(f"\nScore remainder stats (TARGET):")
+    print(f"  Mean: {np.mean(score_remainders):.2f}")
+    print(f"  Std: {np.std(score_remainders):.2f}")
+    print(f"  Min: {np.min(score_remainders):.0f}, Max: {np.max(score_remainders):.0f}")
     
     # 3. Split by game ID
     game_ids = X['game_id'].unique()
@@ -99,8 +109,14 @@ def train_spread_models(n_models=10):
     
     X_train_features = X[train_mask][available_cols]
     X_test_features = X[test_mask][available_cols]
-    y_train_diffs = final_diffs[train_mask]
-    y_test_diffs = final_diffs[test_mask]
+    
+    # Use score remainder as target
+    y_train_remainder = score_remainders[train_mask]
+    y_test_remainder = score_remainders[test_mask]
+    
+    # Keep current_diffs for test set reconstruction
+    test_current_diffs = current_diffs[test_mask]
+    y_test_final_diffs = final_diffs[test_mask]  # For calibration check
     
     print(f"\nTraining: {len(X_train_features)} events, {len(train_ids)} games")
     print(f"Test: {len(X_test_features)} events, {len(test_ids)} games")
@@ -127,7 +143,7 @@ def train_spread_models(n_models=10):
         boot_mask = X_train_game_ids.isin(boot_game_ids)
         
         X_boot = X_train_features[boot_mask]
-        y_boot = y_train_diffs[boot_mask]
+        y_boot = y_train_remainder[boot_mask]  # Score remainder target
         
         # Calculate sample weights based on seconds_remaining
         # More weight = more important to get right
@@ -185,21 +201,32 @@ def train_spread_models(n_models=10):
     test_mean_preds = np.array(test_mean_preds)
     test_std_preds = np.array(test_std_preds)
     
-    # Ensemble mean predictions
-    ensemble_mean = np.mean(test_mean_preds, axis=0)
+    # Ensemble predictions (of score remainder)
+    ensemble_remainder_mean = np.mean(test_mean_preds, axis=0)
     ensemble_std = np.mean(test_std_preds, axis=0)
     
-    # Metrics
-    mae = mean_absolute_error(y_test_diffs, ensemble_mean)
-    rmse = np.sqrt(mean_squared_error(y_test_diffs, ensemble_mean))
+    # Reconstruct expected final diff = current_diff + predicted_remainder
+    reconstructed_final_diff = test_current_diffs + ensemble_remainder_mean
     
-    print(f"\nMean Prediction:")
-    print(f"  MAE: {mae:.2f} points")
-    print(f"  RMSE: {rmse:.2f} points")
+    # Metrics on remainder prediction
+    remainder_mae = mean_absolute_error(y_test_remainder, ensemble_remainder_mean)
+    remainder_rmse = np.sqrt(mean_squared_error(y_test_remainder, ensemble_remainder_mean))
+    
+    # Metrics on reconstructed final diff
+    final_mae = mean_absolute_error(y_test_final_diffs, reconstructed_final_diff)
+    final_rmse = np.sqrt(mean_squared_error(y_test_final_diffs, reconstructed_final_diff))
+    
+    print(f"\nRemainder Prediction (direct model output):")
+    print(f"  MAE: {remainder_mae:.2f} points")
+    print(f"  RMSE: {remainder_rmse:.2f} points")
+    
+    print(f"\nReconstructed Final Diff (current + remainder):")
+    print(f"  MAE: {final_mae:.2f} points")
+    print(f"  RMSE: {final_rmse:.2f} points")
     
     print(f"\nStd Prediction:")
     print(f"  Mean predicted std: {np.mean(ensemble_std):.2f}")
-    print(f"  Actual std of errors: {np.std(y_test_diffs - ensemble_mean):.2f}")
+    print(f"  Actual std of errors: {np.std(y_test_remainder - ensemble_remainder_mean):.2f}")
     
     # Test probability calibration
     print("\n" + "=" * 80)
@@ -212,17 +239,20 @@ def train_spread_models(n_models=10):
     from scipy import stats
     
     for threshold in thresholds:
-        # Predicted probabilities
+        # Predicted probabilities using RECONSTRUCTED final diff
+        # P(final_diff > threshold) = P(current + remainder > threshold)
+        #                           = P(remainder > threshold - current)
+        # But we use reconstructed_final_diff directly for simplicity
         pred_probs = []
-        for mean, std in zip(ensemble_mean, ensemble_std):
-            dist = stats.norm(loc=mean, scale=max(std, 1.0))
+        for recon_mean, std in zip(reconstructed_final_diff, ensemble_std):
+            dist = stats.norm(loc=recon_mean, scale=max(std, 1.0))
             prob = 1 - dist.cdf(threshold)
             pred_probs.append(prob)
         
         pred_probs = np.array(pred_probs)
         
-        # Actual outcomes
-        actual = (y_test_diffs > threshold).astype(float)
+        # Actual outcomes (based on actual final diff)
+        actual = (y_test_final_diffs > threshold).astype(float)
         
         # Calibration: predicted prob vs actual frequency
         mean_pred = np.mean(pred_probs)

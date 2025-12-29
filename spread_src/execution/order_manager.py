@@ -416,11 +416,8 @@ class OrderManager:
         
         if filled:
             lines.append(f"\nFilled: {len(filled)}")
-            for order in filled:
-                market_name = order.ticker.split('-')[-1] if '-' in order.ticker else order.ticker[-10:]
-                lines.append(f"  {market_name}: {order.side.upper()} {order.size} @ {order.price:.1f}¢")
         
         if canceled:
-            lines.append(f"\nCanceled: {len(canceled)}")
+            lines.append(f"Canceled: {len(canceled)}")
         
         return "\n".join(lines)

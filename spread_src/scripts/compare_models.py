@@ -1,16 +1,13 @@
 """
-Compare all 3 spread prediction models.
+Compare Ridge vs XGBoost spread prediction models.
 
-Models:
-1. Ridge Mean+Std (fast baseline)
-2. XGBoost Mean+Std (better accuracy)
-3. Quantile Regression (best calibration)
+Models now predict SCORE REMAINDER (final_diff - current_diff).
+We reconstruct final diff at comparison time to evaluate calibration.
 
 Metrics:
 - MAE, RMSE (point prediction accuracy)
 - Calibration (predicted prob vs actual frequency)
 - Inference speed
-- Feature importance (XGBoost only)
 """
 
 import numpy as np
@@ -72,86 +69,77 @@ def load_models():
     except:
         print("✗ XGBoost models not found")
     
-    try:
-        models['quantile'] = joblib.load('models/nba_spread_quantile.pkl')
-        print("✓ Loaded Quantile models")
-    except:
-        print("✗ Quantile models not found")
-    
     return models
 
 
-def predict_ridge(models, X):
-    """Predict using Ridge ensemble."""
-    mean_preds = []
+def predict_ridge(models, X, current_diffs):
+    """
+    Predict using Ridge ensemble.
+    
+    Models predict REMAINDER. We add current_diff to get reconstructed final diff.
+    Supports both variance_model (new) and std_model (legacy) formats.
+    """
+    remainder_preds = []
     std_preds = []
     
     for model_pair in models:
-        mean_pred = model_pair['mean_model'].predict(X)
-        std_pred = model_pair['std_model'].predict(X)
-        mean_preds.append(mean_pred)
+        remainder_pred = model_pair['mean_model'].predict(X)
+        
+        # Support both formats
+        if 'variance_model' in model_pair:
+            variance = model_pair['variance_model'].predict(X)
+            std_pred = np.sqrt(np.maximum(variance, 1.0))
+        else:
+            std_pred = model_pair['std_model'].predict(X)
+        
+        remainder_preds.append(remainder_pred)
         std_preds.append(std_pred)
     
-    return np.mean(mean_preds, axis=0), np.mean(std_preds, axis=0)
+    mean_remainder = np.mean(remainder_preds, axis=0)
+    mean_std = np.mean(std_preds, axis=0)
+    
+    # Reconstruct final diff
+    reconstructed_final_diff = current_diffs + mean_remainder
+    
+    return reconstructed_final_diff, mean_std, mean_remainder
 
 
-def predict_xgboost(models, X):
-    """Predict using XGBoost ensemble."""
-    mean_preds = []
+def predict_xgboost(models, X, current_diffs):
+    """
+    Predict using XGBoost ensemble.
+    
+    Models predict REMAINDER. We add current_diff to get reconstructed final diff.
+    Supports both variance_model (new) and std_model (legacy) formats.
+    """
+    remainder_preds = []
     std_preds = []
     
     for model_pair in models:
-        mean_pred = model_pair['mean_model'].predict(X)
-        std_pred = model_pair['std_model'].predict(X)
-        mean_preds.append(mean_pred)
+        remainder_pred = model_pair['mean_model'].predict(X)
+        
+        # Support both formats
+        if 'variance_model' in model_pair:
+            variance = model_pair['variance_model'].predict(X)
+            std_pred = np.sqrt(np.maximum(variance, 1.0))
+        else:
+            std_pred = model_pair['std_model'].predict(X)
+        
+        remainder_preds.append(remainder_pred)
         std_preds.append(std_pred)
     
-    return np.mean(mean_preds, axis=0), np.mean(std_preds, axis=0)
-
-
-def predict_quantile(models, X):
-    """Predict using Quantile ensemble."""
-    quantiles = [0.10, 0.25, 0.50, 0.75, 0.90]
-    quantile_preds = {q: [] for q in quantiles}
+    mean_remainder = np.mean(remainder_preds, axis=0)
+    mean_std = np.mean(std_preds, axis=0)
     
-    for model_set in models:
-        for q in quantiles:
-            pred = model_set[q].predict(X)
-            quantile_preds[q].append(pred)
+    # Reconstruct final diff
+    reconstructed_final_diff = current_diffs + mean_remainder
     
-    # Average across ensemble
-    ensemble_quantiles = {q: np.mean(quantile_preds[q], axis=0) for q in quantiles}
-    
-    # Return median as point estimate, IQR/1.35 as std estimate
-    median = ensemble_quantiles[0.50]
-    iqr = ensemble_quantiles[0.75] - ensemble_quantiles[0.25]
-    std_est = iqr / 1.35  # IQR ≈ 1.35 * std for normal
-    
-    return median, std_est, ensemble_quantiles
+    return reconstructed_final_diff, mean_std, mean_remainder
 
 
 def compute_prob_gt_threshold(mean, std, threshold):
     """Compute P(diff > threshold) assuming normal."""
     dist = stats.norm(loc=mean, scale=max(std, 1.0))
     return 1 - dist.cdf(threshold)
-
-
-def compute_prob_gt_threshold_quantile(quantiles_dict, threshold, idx):
-    """Compute P(diff > threshold) via quantile interpolation."""
-    quantiles = [0.10, 0.25, 0.50, 0.75, 0.90]
-    q_vals = [quantiles_dict[q][idx] for q in quantiles]
-    
-    if threshold < q_vals[0]:
-        return 0.95
-    elif threshold > q_vals[-1]:
-        return 0.05
-    else:
-        for j in range(len(quantiles) - 1):
-            if q_vals[j] <= threshold <= q_vals[j+1]:
-                frac = (threshold - q_vals[j]) / (q_vals[j+1] - q_vals[j] + 1e-8)
-                q_at_threshold = quantiles[j] + frac * (quantiles[j+1] - quantiles[j])
-                return 1 - q_at_threshold
-        return 0.5
 
 
 def compare_models():
@@ -174,7 +162,13 @@ def compare_models():
     available_cols = [c for c in feature_cols if c in X.columns]
     
     X_test = X[test_mask][available_cols]
-    y_test = final_diffs[test_mask]
+    y_test_final_diffs = final_diffs[test_mask]  # Actual final diffs for evaluation
+    
+    # Get current diffs for reconstruction
+    current_diffs = X[test_mask]['score_diff'].values
+    
+    # Also compute actual remainders for comparing raw model output
+    y_test_remainder = y_test_final_diffs - current_diffs
     
     print(f"Test set: {len(X_test)} events, {len(test_ids)} games")
     
@@ -200,38 +194,40 @@ def compare_models():
         # Predict
         start = time.time()
         
-        if name == 'quantile':
-            median, std_est, quantiles = predict_quantile(model_ensemble, X_test)
-            mean_pred = median
-            std_pred = std_est
-        elif name == 'xgboost':
-            mean_pred, std_pred = predict_xgboost(model_ensemble, X_test)
+        if name == 'xgboost':
+            mean_pred, std_pred, remainder_pred = predict_xgboost(model_ensemble, X_test, current_diffs)
         else:  # ridge
-            mean_pred, std_pred = predict_ridge(model_ensemble, X_test)
+            mean_pred, std_pred, remainder_pred = predict_ridge(model_ensemble, X_test, current_diffs)
         
         inference_time = (time.time() - start) * 1000  # ms
         
-        # Metrics
-        mae = mean_absolute_error(y_test, mean_pred)
-        rmse = np.sqrt(mean_squared_error(y_test, mean_pred))
+        # Metrics on REMAINDER (raw model output)
+        remainder_mae = mean_absolute_error(y_test_remainder, remainder_pred)
+        remainder_rmse = np.sqrt(mean_squared_error(y_test_remainder, remainder_pred))
+        
+        # Metrics on RECONSTRUCTED FINAL DIFF (what we actually care about)
+        final_mae = mean_absolute_error(y_test_final_diffs, mean_pred)
+        final_rmse = np.sqrt(mean_squared_error(y_test_final_diffs, mean_pred))
         
         # Bias
-        bias = np.mean(mean_pred - y_test)
+        bias = np.mean(mean_pred - y_test_final_diffs)
         
         # Std calibration
-        actual_std = np.std(y_test - mean_pred)
+        actual_std = np.std(y_test_final_diffs - mean_pred)
         predicted_std = np.mean(std_pred)
         
-        print(f"MAE:           {mae:.2f} points")
-        print(f"RMSE:          {rmse:.2f} points")
-        print(f"Bias:          {bias:+.2f} points")
-        print(f"Predicted Std: {predicted_std:.2f}")
-        print(f"Actual Std:    {actual_std:.2f}")
-        print(f"Inference:     {inference_time:.1f} ms ({inference_time/len(X_test):.3f} ms/row)")
+        print(f"Remainder MAE:     {remainder_mae:.2f} points (raw model output)")
+        print(f"Final Diff MAE:    {final_mae:.2f} points (reconstructed)")
+        print(f"Final Diff RMSE:   {final_rmse:.2f} points")
+        print(f"Bias:              {bias:+.2f} points")
+        print(f"Predicted Std:     {predicted_std:.2f}")
+        print(f"Actual Std:        {actual_std:.2f}")
+        print(f"Inference:         {inference_time:.1f} ms ({inference_time/len(X_test):.3f} ms/row)")
         
         results[name] = {
-            'mae': mae,
-            'rmse': rmse,
+            'remainder_mae': remainder_mae,
+            'mae': final_mae,
+            'rmse': final_rmse,
             'bias': bias,
             'predicted_std': predicted_std,
             'actual_std': actual_std,
@@ -239,9 +235,6 @@ def compare_models():
             'mean_pred': mean_pred,
             'std_pred': std_pred
         }
-        
-        if name == 'quantile':
-            results[name]['quantiles'] = quantiles
     
     # Calibration
     print("\n" + "=" * 80)
@@ -252,25 +245,18 @@ def compare_models():
     
     for threshold in thresholds:
         print(f"\nP(diff > {threshold:+.0f}):")
-        print(f"  Actual: {np.mean(y_test > threshold):.1%}")
+        print(f"  Actual: {np.mean(y_test_final_diffs > threshold):.1%}")
         
         for name in results.keys():
             mean_pred = results[name]['mean_pred']
             std_pred = results[name]['std_pred']
             
-            if name == 'quantile':
-                # Interpolate
-                probs = [compute_prob_gt_threshold_quantile(
-                    results[name]['quantiles'], threshold, i
-                ) for i in range(len(y_test))]
-                pred_prob = np.mean(probs)
-            else:
-                # Parametric
-                probs = [compute_prob_gt_threshold(m, s, threshold) 
-                        for m, s in zip(mean_pred, std_pred)]
-                pred_prob = np.mean(probs)
+            # Parametric probability using reconstructed final diff
+            probs = [compute_prob_gt_threshold(m, s, threshold) 
+                    for m, s in zip(mean_pred, std_pred)]
+            pred_prob = np.mean(probs)
             
-            error = abs(pred_prob - np.mean(y_test > threshold))
+            error = abs(pred_prob - np.mean(y_test_final_diffs > threshold))
             print(f"  {name:8s}: {pred_prob:.1%} (error: {error:.1%})")
     
     # Summary table
@@ -305,17 +291,11 @@ def compare_models():
             mean_pred = results[name]['mean_pred']
             std_pred = results[name]['std_pred']
             
-            if name == 'quantile':
-                probs = [compute_prob_gt_threshold_quantile(
-                    results[name]['quantiles'], threshold, i
-                ) for i in range(len(y_test))]
-                pred_prob = np.mean(probs)
-            else:
-                probs = [compute_prob_gt_threshold(m, s, threshold) 
-                        for m, s in zip(mean_pred, std_pred)]
-                pred_prob = np.mean(probs)
+            probs = [compute_prob_gt_threshold(m, s, threshold) 
+                    for m, s in zip(mean_pred, std_pred)]
+            pred_prob = np.mean(probs)
             
-            error = abs(pred_prob - np.mean(y_test > threshold))
+            error = abs(pred_prob - np.mean(y_test_final_diffs > threshold))
             errors.append(error)
         
         cal_scores[name] = np.mean(errors)

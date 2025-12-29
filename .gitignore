@@ -1,5 +1,5 @@
 *.db
 *.sqlite3
-
+*.csv
 # Ignore the specific large data file (just in case)
 data/nba_data.db

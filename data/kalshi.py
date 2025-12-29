@@ -409,4 +409,54 @@ class KalshiClient:
         except Exception as e:
             print(f"Error fetching balance: {e}")
             return None
+    
+    def get_settlements(self, ticker=None, event_ticker=None, min_ts=None, max_ts=None, limit=200):
+        """
+        Get settlement history.
+        
+        Args:
+            ticker: Filter by market ticker
+            event_ticker: Filter by event ticker (can be comma-separated list, max 10)
+            min_ts: Filter after this Unix timestamp (milliseconds)
+            max_ts: Filter before this Unix timestamp (milliseconds)
+            limit: Max results (1-200, default 200)
+            
+        Returns:
+            List of settlement dicts with:
+                - ticker: market ticker
+                - event_ticker: event ticker
+                - market_result: 'yes', 'no', 'scalar', or 'void'
+                - yes_count, no_count: contracts held at settlement
+                - yes_total_cost, no_total_cost: cost basis in cents
+                - revenue: payout in cents
+                - settled_time: ISO timestamp
+                - fee_cost: fees paid (string, dollars)
+                - value: payout per yes contract in cents
+        """
+        endpoint = "/portfolio/settlements"
+        path = "/trade-api/v2/portfolio/settlements"
+        
+        params = {"limit": limit}
+        if ticker:
+            params['ticker'] = ticker
+        if event_ticker:
+            params['event_ticker'] = event_ticker
+        if min_ts:
+            params['min_ts'] = min_ts
+        if max_ts:
+            params['max_ts'] = max_ts
+        
+        headers = self._get_headers("GET", path)
+        
+        try:
+            response = requests.get(
+                f"{self.base_url}{endpoint}",
+                headers=headers,
+                params=params
+            )
+            response.raise_for_status()
+            return response.json().get('settlements', [])
+        except Exception as e:
+            print(f"Error fetching settlements: {e}")
+            return []
 

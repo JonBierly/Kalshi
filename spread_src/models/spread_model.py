@@ -19,8 +19,11 @@ class SpreadDistributionModel:
     """
     Predicts probability that score differential exceeds various thresholds.
     
-    Uses parametric approach: fit a distribution (normal, skew-normal, etc.)
-    to the score differential, then compute P(diff > threshold) analytically.
+    Model predicts SCORE REMAINDER (final_diff - current_diff).
+    At inference, we add current_diff to get expected final diff.
+    
+    Uses parametric approach: fit a distribution (normal) to the
+    reconstructed final diff, then compute P(diff > threshold) analytically.
     """
     
     def __init__(self, models_path='models/nba_spread_model.pkl'):
@@ -43,9 +46,11 @@ class SpreadDistributionModel:
         """
         Predict distribution parameters from ensemble.
         
+        Model predicts REMAINDER. We add current_diff to get reconstructed final diff.
+        
         Returns:
             {
-                'mean': array of means from each model,
+                'mean': array of reconstructed final diff means from each model,
                 'std': array of stds from each model,
             }
         """
@@ -58,21 +63,32 @@ class SpreadDistributionModel:
         row_data = {col: live_features.get(col, 0.0) for col in feature_order}
         X_live = pd.DataFrame([row_data], columns=feature_order)
         
-        # Get predictions from each model
-        means = []
+        # Get current score diff for reconstruction
+        current_diff = live_features.get('score_diff', 0.0)
+        
+        # Get predictions from each model (remainders)
+        means = []  # These will be reconstructed final diffs
         stds = []
         
         for model in self.models:
-            # Each model is a dict with 'mean_model' and 'std_model'
+            # Each model is a dict with 'mean_model' and 'variance_model' (or legacy 'std_model')
             if isinstance(model, dict):
-                mean_pred = model['mean_model'].predict(X_live)[0]
-                std_pred = model['std_model'].predict(X_live)[0]
+                remainder_pred = model['mean_model'].predict(X_live)[0]
+                
+                # Support both old (std_model) and new (variance_model) formats
+                if 'variance_model' in model:
+                    variance_pred = model['variance_model'].predict(X_live)[0]
+                    std_pred = np.sqrt(max(variance_pred, 1.0))  # sqrt(variance) = std
+                else:
+                    std_pred = model['std_model'].predict(X_live)[0]
             else:
-                # Fallback: single model predicts mean only
-                mean_pred = model.predict(X_live)[0]
+                # Fallback: single model predicts remainder only
+                remainder_pred = model.predict(X_live)[0]
                 std_pred = 5.0  # Default uncertainty
             
-            means.append(mean_pred)
+            # Reconstruct final diff = current_diff + remainder
+            reconstructed_mean = current_diff + remainder_pred
+            means.append(reconstructed_mean)
             stds.append(max(std_pred, 1.0))  # Ensure positive std
         
         return {

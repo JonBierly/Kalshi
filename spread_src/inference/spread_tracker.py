@@ -141,7 +141,12 @@ class SpreadTracker:
         """
         Predict spread distribution using ensemble.
         
-        Returns mean and std of score differential.
+        Model predicts SCORE REMAINDER (how much margin will change).
+        We add current_diff to get expected final diff.
+        
+        Variance model predicts variance (squared error), we take sqrt for std.
+        
+        Returns mean and std of final score differential.
         """
         # Prepare features
         from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
@@ -149,17 +154,29 @@ class SpreadTracker:
         row_data = {col: live_features.get(col, 0.0) for col in feature_order}
         X_live = pd.DataFrame([row_data], columns=feature_order)
         
-        # Get predictions from ensemble
-        mean_preds = []
+        # Get current score diff for reconstruction
+        current_diff = live_features.get('score_diff', 0.0)
+        
+        # Get predictions from ensemble (these are REMAINDERS, not final diffs)
+        remainder_preds = []
         std_preds = []
         
         for model_pair in self.spread_models:
-            mean_pred = model_pair['mean_model'].predict(X_live)[0]
-            std_pred = model_pair['std_model'].predict(X_live)[0]
-            mean_preds.append(mean_pred)
+            remainder_pred = model_pair['mean_model'].predict(X_live)[0]
+            
+            # Support both old (std_model) and new (variance_model) formats
+            if 'variance_model' in model_pair:
+                variance_pred = model_pair['variance_model'].predict(X_live)[0]
+                std_pred = np.sqrt(max(variance_pred, 1.0))  # sqrt(variance) = std
+            else:
+                std_pred = model_pair['std_model'].predict(X_live)[0]
+            
+            remainder_preds.append(remainder_pred)
             std_preds.append(max(std_pred, 1.0))
         
-        mean = np.mean(mean_preds)
+        # Reconstruct expected final diff = current_diff + predicted_remainder
+        mean_remainder = np.mean(remainder_preds)
+        mean = current_diff + mean_remainder  # Expected final diff
         std = np.mean(std_preds)
         
         return mean, std

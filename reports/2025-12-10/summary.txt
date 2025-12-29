@@ -1,0 +1,19 @@
+============================================================
+DAILY PERFORMANCE REPORT: 2025-12-10
+Generated: 2025-12-11 08:50:15
+============================================================
+
+📊 OVERALL STATISTICS
+----------------------------------------
+Total Orders Placed: 1018
+Total Fills: 0
+Fill Rate: 0.0%
+
+🔍 KEY FINDINGS
+----------------------------------------
+
+📁 FILES GENERATED
+----------------------------------------
+• liquidity_analysis.png
+• full_trades.csv
+• summary.txt

@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 from src.data.acquisition import LiveClient
-from src.features.engineering import TeamStatsEngine, RosterEngine, FeatureEngine
+from spread_src.features.engineering import TeamStatsEngine, RosterEngine, FeatureEngine
 from src.models.prediction import PredictionEngine
 
 class LiveGameOrchestrator:
@@ -125,34 +125,33 @@ class LiveGameOrchestrator:
                 away_team = data['awayTeam']
                 
                 # Update FeatureEngine State directly
-                self.feature_engine.home_stats = {
+                self.feature_engine.home_stats.update({
                     'fgm': home_team['statistics']['fieldGoalsMade'],
                     'fga': home_team['statistics']['fieldGoalsAttempted'],
                     'fg3m': home_team['statistics']['threePointersMade'],
                     'to': home_team['statistics']['turnovers'],
-                    'reb': home_team['statistics']['reboundsTotal']
-                }
+                    'reb': home_team['statistics']['reboundsTotal'],
+                    'pts': home_team['score'],
+                    'fta': home_team['statistics']['freeThrowsAttempted'],
+                    'oreb': home_team['statistics']['reboundsOffensive']
+                })
                 
-                self.feature_engine.away_stats = {
+                self.feature_engine.away_stats.update({
                     'fgm': away_team['statistics']['fieldGoalsMade'],
                     'fga': away_team['statistics']['fieldGoalsAttempted'],
                     'fg3m': away_team['statistics']['threePointersMade'],
                     'to': away_team['statistics']['turnovers'],
-                    'reb': away_team['statistics']['reboundsTotal']
-                }
+                    'reb': away_team['statistics']['reboundsTotal'],
+                    'pts': away_team['score'],
+                    'fta': away_team['statistics']['freeThrowsAttempted'],
+                    'oreb': away_team['statistics']['reboundsOffensive']
+                })
                 
                 # Construct "Event Row" for the remaining features (Score, Time)
                 # Parse Clock
-                # Format: PT12M00.00S
-                clock_str = data['gameStatusText'] # This might be "Final" or "Q1 10:00"
-                # Actually data['gameClock'] is usually the ISO string in V3
-                # Let's check the structure.
-                # In live endpoint, it's often data['gameClock'] -> "PT10M00.00S"
-                
                 remaining_time = 0
                 period = data['period']
                 
-                # Parse ISO time if present
                 if 'gameClock' in data:
                     t_str = data['gameClock']
                     t_str = t_str.replace('PT', '').replace('M', ':').replace('S', '')
@@ -160,26 +159,24 @@ class LiveGameOrchestrator:
                         m, s = t_str.split(':')
                         remaining_time = int(m) * 60 + float(s)
                 
-                # Calculate total seconds remaining (approx)
                 total_seconds = remaining_time
                 if period <= 4:
                     total_seconds += (4 - period) * 720
                 
-                # Create dummy row to trigger update() - but we already set stats.
-                # We just need the derived features.
-                # Let's manually call the internal calc methods or just construct the dict.
-                
-                live_features = {
-                    'score_diff': home_team['score'] - away_team['score'],
-                    'seconds_remaining': total_seconds,
-                    'home_efg': self.feature_engine._calc_efg(self.feature_engine.home_stats),
-                    'away_efg': self.feature_engine._calc_efg(self.feature_engine.away_stats),
-                    'turnover_diff': self.feature_engine.home_stats['to'] - self.feature_engine.away_stats['to'],
-                    'home_rebound_rate': self.feature_engine._calc_reb_rate(self.feature_engine.home_stats['reb'], self.feature_engine.away_stats['reb']),
-                    'game_id': game_id,
-                    'home_team_id': home_team_id,
-                    'away_team_id': away_team_id
-                }
+                # Update history for momentum and calculate current features
+                score_diff = home_team['score'] - away_team['score']
+                self.feature_engine.history.append((total_seconds, score_diff))
+                # Prune history to last 10 mins
+                if len(self.feature_engine.history) > 1000:
+                    self.feature_engine.history = [h for h in self.feature_engine.history if h[0] < total_seconds + 600]
+
+                live_features = self.feature_engine.calculate_current_features(
+                    score_diff, 
+                    total_seconds, 
+                    game_id, 
+                    home_team_id, 
+                    away_team_id
+                )
                 
                 # 3. Predict
                 # Merge with context

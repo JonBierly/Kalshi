@@ -2,7 +2,7 @@ import joblib
 import pandas as pd
 import numpy as np
 import time
-from src.features.engineering import FeatureEngine, TeamStatsEngine, RosterEngine, BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from spread_src.features.engineering import FeatureEngine, TeamStatsEngine, RosterEngine, BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
 
 class PredictionEngine:
     def __init__(self, model_type='lr', model_path=None):

@@ -42,23 +42,21 @@ class SpreadDistributionModel:
             print(f"No models found at {models_path}")
             self.models = []
     
-    def predict_distribution_params(self, live_features: dict) -> Dict[str, np.ndarray]:
+    def predict_distribution_params(self, live_features: dict, variance_multiplier: float = 1.0) -> Dict[str, np.ndarray]:
         """
         Predict distribution parameters from ensemble.
         
         Model predicts REMAINDER. We add current_diff to get reconstructed final diff.
         
-        Returns:
-            {
-                'mean': array of reconstructed final diff means from each model,
-                'std': array of stds from each model,
-            }
+        Args:
+            live_features: Live game features
+            variance_multiplier: Factor to scale predicted variance (variance * multiplier)
         """
         if not self.models:
             raise ValueError("No models loaded")
         
         # Prepare features
-        from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+        from spread_src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
         feature_order = BASE_FEATURES_LIST + ADVANCED_FEATURES_LIST
         row_data = {col: live_features.get(col, 0.0) for col in feature_order}
         X_live = pd.DataFrame([row_data], columns=feature_order)
@@ -78,13 +76,16 @@ class SpreadDistributionModel:
                 # Support both old (std_model) and new (variance_model) formats
                 if 'variance_model' in model:
                     variance_pred = model['variance_model'].predict(X_live)[0]
-                    std_pred = np.sqrt(max(variance_pred, 1.0))  # sqrt(variance) = std
+                    # Apply multiplier to variance, then sqrt for std
+                    std_pred = np.sqrt(max(variance_pred * variance_multiplier, 1.0))
                 else:
                     std_pred = model['std_model'].predict(X_live)[0]
+                    # For legacy std models, multiplier applies to variance so scale std by sqrt(multiplier)
+                    std_pred = std_pred * np.sqrt(variance_multiplier)
             else:
                 # Fallback: single model predicts remainder only
                 remainder_pred = model.predict(X_live)[0]
-                std_pred = 5.0  # Default uncertainty
+                std_pred = 5.0 * np.sqrt(variance_multiplier)  # Default uncertainty scaled
             
             # Reconstruct final diff = current_diff + remainder
             reconstructed_mean = current_diff + remainder_pred
@@ -96,13 +97,14 @@ class SpreadDistributionModel:
             'std': np.array(stds)
         }
     
-    def predict_spread_probabilities(self, live_features: dict, thresholds: List[float]) -> Dict:
+    def predict_spread_probabilities(self, live_features: dict, thresholds: List[float], variance_multiplier: float = 1.0) -> Dict:
         """
         Predict P(score_diff > threshold) for each threshold.
         
         Args:
             live_features: Live game features
             thresholds: List of spread values (e.g., [3.5, 6.5, 9.5])
+            variance_multiplier: Scale predicted variance
         
         Returns:
             {
@@ -115,7 +117,7 @@ class SpreadDistributionModel:
             }
         """
         # Get distribution parameters from ensemble
-        params = self.predict_distribution_params(live_features)
+        params = self.predict_distribution_params(live_features, variance_multiplier)
         
         # For each model in ensemble, compute P(diff > threshold) for each threshold
         all_probs = []  # Shape: (n_models, n_thresholds)

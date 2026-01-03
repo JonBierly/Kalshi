@@ -25,7 +25,7 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
-from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from spread_src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
 
 
 def load_splits(splits_dir='data/splits'):

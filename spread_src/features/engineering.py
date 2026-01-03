@@ -1,4 +1,5 @@
 import pandas as pd
+print("DEBUG: Using spread_src/features/engineering.py")
 import numpy as np
 from src.data.database import DatabaseManager, PlayerAdvancedStats, TeamBasicStats, Game
 from datetime import timedelta
@@ -35,6 +36,7 @@ class TeamStatsEngine:
         df['possessions'] = 0.96 * (df['fga'] + 0.44 * df['fta'] - df['oreb'] + df['tov'])
         df['possessions'] = df['possessions'].replace(0, 1)
         df['off_rtg'] = 100 * df['pts'] / df['possessions']
+        df['pace'] = 48 * df['possessions'] / df['min'].replace(0, 48)
         
         # Self-join to get opponent stats for defensive rating
         opp_df = df[['game_id', 'team_id', 'pts', 'possessions']].rename(
@@ -45,7 +47,6 @@ class TeamStatsEngine:
         df_merged = df_merged[df_merged['team_id'] != df_merged['opp_id']]
         
         df_merged['def_rtg'] = 100 * df_merged['opp_pts'] / df_merged['opp_poss']
-        # df_merged['net_rtg'] = df_merged['off_rtg'] - df_merged['def_rtg'] # Removed as redundant
         df_merged['win'] = df_merged['wl'].apply(lambda x: 1 if x == 'W' else 0)
         
         features = []
@@ -55,12 +56,12 @@ class TeamStatsEngine:
             team_df = team_df.sort_values('game_date')
             
             # Season-to-Date (Expanding, shifted to exclude current game)
-            season_stats = team_df[['off_rtg', 'def_rtg', 'win']].expanding().mean().shift(1)
+            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace']].expanding().mean().shift(1)
             season_stats.columns = [f'team_season_{c}' for c in season_stats.columns]
             season_stats = season_stats.rename(columns={'team_season_win': 'team_season_win_pct'})
             
             # Recent (Last 10, shifted)
-            recent_stats = team_df[['off_rtg', 'def_rtg', 'win']].rolling(window=10, min_periods=1).mean().shift(1)
+            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace']].rolling(window=10, min_periods=1).mean().shift(1)
             recent_stats.columns = [f'team_recent_{c}' for c in recent_stats.columns]
             recent_stats = recent_stats.rename(columns={'team_recent_win': 'team_recent_win_pct'})
             
@@ -87,6 +88,7 @@ class TeamStatsEngine:
         df['possessions'] = 0.96 * (df['fga'] + 0.44 * df['fta'] - df['oreb'] + df['tov'])
         df['possessions'] = df['possessions'].replace(0, 1)
         df['off_rtg'] = 100 * df['pts'] / df['possessions']
+        df['pace'] = 48 * df['possessions'] / df['min'].replace(0, 48)
         
         # Self-join to get opponent stats
         opp_df = df[['game_id', 'team_id', 'pts', 'possessions']].rename(
@@ -100,8 +102,6 @@ class TeamStatsEngine:
         df_merged['win'] = df_merged['wl'].apply(lambda x: 1 if x == 'W' else 0)
         
         latest_stats = {}
-        print(f"DEBUG: df_merged shape: {df_merged.shape}")
-        print(f"DEBUG: Unique teams in df_merged: {df_merged['team_id'].nunique()}")
         
         # Group by Team AND Season
         for (team_id, season), team_df in df_merged.groupby(['team_id', 'season']):
@@ -110,13 +110,12 @@ class TeamStatsEngine:
             if team_df.empty: continue
                 
             # Season-to-Date (Expanding, NO SHIFT)
-            season_stats = team_df[['off_rtg', 'def_rtg', 'win']].expanding().mean().iloc[-1]
+            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace']].expanding().mean().iloc[-1]
             
             # Recent (Last 10, NO SHIFT)
-            recent_stats = team_df[['off_rtg', 'def_rtg', 'win']].rolling(window=10, min_periods=1).mean().iloc[-1]
+            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace']].rolling(window=10, min_periods=1).mean().iloc[-1]
             
-            # Rest Days (Diff between last game and NOW? Or just last gap?)
-            # For live inference, rest days is (Today - Last Game Date)
+            # Rest Days relative to now logic stays in get_latest_features
             last_game_date = team_df['game_date'].iloc[-1]
             
             stats = {}
@@ -124,16 +123,16 @@ class TeamStatsEngine:
             stats['team_season_off_rtg'] = season_stats['off_rtg']
             stats['team_season_def_rtg'] = season_stats['def_rtg']
             stats['team_season_win_pct'] = season_stats['win']
+            stats['team_season_pace'] = season_stats['pace']
             
             # Recent
             stats['team_recent_off_rtg'] = recent_stats['off_rtg']
             stats['team_recent_def_rtg'] = recent_stats['def_rtg']
             stats['team_recent_win_pct'] = recent_stats['win']
+            stats['team_recent_pace'] = recent_stats['pace']
             
             stats['last_game_date'] = last_game_date
             
-            # Overwrite with latest season's data
-            # Since groupby sorts by keys, later seasons come last
             latest_stats[team_id] = stats
             
         return latest_stats
@@ -444,9 +443,12 @@ class FeatureEngine:
         self.reset()
 
     def reset(self):
-        self.home_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0}
-        self.away_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0}
+        self.home_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0, 'pts': 0, 'fta': 0, 'oreb': 0}
+        self.away_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0, 'pts': 0, 'fta': 0, 'oreb': 0}
+        self.history = [] # List of (seconds_remaining, score_diff)
         self.current_features = {}
+        self.lead_changes = 0
+        self.last_leader = 0 # 1 for home, -1 for away, 0 for tie
 
     def update(self, event_row: pd.Series):
         """Updates game state based on a single PBP event row and returns the new feature vector."""
@@ -458,37 +460,109 @@ class FeatureEngine:
         stats = self.home_stats if is_home else self.away_stats
         
         # Update Stats based on Event Type
-        if event_type == 1: # Make
+        event_type_str = str(event_type).lower()
+        
+        if event_type == 1 or 'made shot' in event_type_str: # Make
             stats['fgm'] += 1
             stats['fga'] += 1
-            if '3pt' in description:
-                stats['fg3m'] += 1
-        elif event_type == 2: # Miss
+            pts = 3 if '3pt' in description else 2
+            stats['pts'] += pts
+            if pts == 3: stats['fg3m'] += 1
+        elif event_type == 2 or 'missed shot' in event_type_str: # Miss
             stats['fga'] += 1
-        elif event_type == 4: # Rebound
+        elif event_type == 4 or 'rebound' in event_type_str: # Rebound
             stats['reb'] += 1
-        elif event_type == 5: # Turnover
+            if 'offensive' in description: stats['oreb'] += 1
+        elif event_type == 5 or 'turnover' in event_type_str: # Turnover
             stats['to'] += 1
+        elif 'free throw' in event_type_str:
+            stats['fta'] += 1
+            if 'miss' not in description:
+                stats['pts'] += 1
             
-        # Calculate Features
-        # Handle seconds remaining logic (approximate if not strictly provided)
+        # Time remaining logic
         seconds_remaining = event_row['remaining_time']
         if event_row['period'] <= 4:
             seconds_remaining += (4 - event_row['period']) * 720
             
+        # Update history for momentum (keep last 10 mins)
+        new_diff = event_row['score_diff']
+        self.history.append((seconds_remaining, new_diff))
+        
+        # Track Lead Changes
+        current_leader = np.sign(new_diff) if new_diff != 0 else 0
+        if current_leader != 0 and self.last_leader != 0 and current_leader != self.last_leader:
+            self.lead_changes += 1
+        if current_leader != 0:
+            self.last_leader = current_leader
+
+        if len(self.history) > 1000: # Safety cap
+             self.history = [h for h in self.history if h[0] < seconds_remaining + 600]
+
+        return self.calculate_current_features(event_row['score_diff'], seconds_remaining, event_row['period'], event_row['game_id'], event_row['home_team_id'], event_row['away_team_id'])
+
+    def calculate_current_features(self, score_diff, seconds_remaining, period, game_id, home_id, away_id):
+        """Calculates features from current internal state."""
+        # Momentum: Change in score diff over last 5 minutes (300 seconds)
+        momentum = 0
+        if self.history:
+            start_score = self.history[0][1]
+            for h_time, h_score in reversed(self.history):
+                if h_time > seconds_remaining + 300:
+                    start_score = h_score
+                    break
+            momentum = score_diff - start_score
+            
+        # Lead Changes: Count lead swaps since game start
+        current_leader = 1 if score_diff > 0 else (-1 if score_diff < 0 else 0)
+        if current_leader != 0 and self.last_leader != 0 and current_leader != self.last_leader:
+            self.lead_changes += 1
+        if current_leader != 0:
+            self.last_leader = current_leader
+            
+        # Score Volatility: Std dev of score diff over last 5 minutes
+        score_volatility = 0
+        if self.history:
+            window_scores = [h[1] for h in self.history if h[0] > seconds_remaining and h[0] <= seconds_remaining + 300]
+            if len(window_scores) > 1:
+                score_volatility = np.std(window_scores)
+
+        # Live Pace: possessions per 48 mins
+        home_poss = 0.96 * (self.home_stats['fga'] + 0.44 * self.home_stats['fta'] - self.home_stats['oreb'] + self.home_stats['to'])
+        away_poss = 0.96 * (self.away_stats['fga'] + 0.44 * self.away_stats['fta'] - self.away_stats['oreb'] + self.away_stats['to'])
+        total_poss = home_poss + away_poss
+        
+        elapsed_mins = (2880 - seconds_remaining) / 60
+        live_pace = (total_poss / max(elapsed_mins, 1)) * 48
+
+        # 3P Reliance
+        home_3p_reliance = (self.home_stats['fg3m'] * 3) / max(self.home_stats['pts'], 1)
+        away_3p_reliance = (self.away_stats['fg3m'] * 3) / max(self.away_stats['pts'], 1)
+
         self.current_features = {
-            'score_diff': event_row['score_diff'],
+            'score_diff': score_diff,
             'seconds_remaining': seconds_remaining,
+            'period': period,
+            'period_1': 1 if period == 1 else 0,
+            'period_2': 1 if period == 2 else 0,
+            'period_3': 1 if period == 3 else 0,
+            'period_4': 1 if period == 4 else 0,
+            'period_5': 1 if period >= 5 else 0,
+            'lead_changes': self.lead_changes,
+            'score_volatility': score_volatility,
             'home_efg': self._calc_efg(self.home_stats),
             'away_efg': self._calc_efg(self.away_stats),
             'turnover_diff': self.home_stats['to'] - self.away_stats['to'],
             'home_rebound_rate': self._calc_reb_rate(self.home_stats['reb'], self.away_stats['reb']),
-            'required_catchup_rate': abs(event_row['score_diff']) / (seconds_remaining + 1),
-            'game_id': event_row['game_id'],
-            'home_team_id': event_row['home_team_id'],
-            'away_team_id': event_row['away_team_id']
+            'required_catchup_rate': abs(score_diff) / (seconds_remaining + 1),
+            'live_pace': live_pace,
+            'score_momentum': momentum,
+            'home_3p_reliance': home_3p_reliance,
+            'away_3p_reliance': away_3p_reliance,
+            'game_id': game_id,
+            'home_team_id': home_id,
+            'away_team_id': away_id
         }
-        
         return self.current_features
 
     def _calc_efg(self, stats):
@@ -562,8 +636,8 @@ def add_advanced_features(pbp_df: pd.DataFrame) -> pd.DataFrame:
 # Advanced features - using only recent stats (removed season stats due to high correlation)
 ADVANCED_FEATURES_LIST = [
     # Team recent performance (last 10 games)
-    'home_team_recent_off_rtg', 'home_team_recent_def_rtg', 'home_team_recent_win_pct',
-    'away_team_recent_off_rtg', 'away_team_recent_def_rtg', 'away_team_recent_win_pct',
+    'home_team_recent_off_rtg', 'home_team_recent_def_rtg', 'home_team_recent_win_pct', 'home_team_recent_pace',
+    'away_team_recent_off_rtg', 'away_team_recent_def_rtg', 'away_team_recent_win_pct', 'away_team_recent_pace',
     
     # Rest and home court
     'home_rest_days', 'home_is_home',
@@ -576,4 +650,16 @@ ADVANCED_FEATURES_LIST = [
     'away_roster_recent_pie', 'away_roster_recent_est_usg_pct'
 ]
 
-BASE_FEATURES_LIST = ['score_diff', 'seconds_remaining', 'home_efg', 'away_efg', 'turnover_diff', 'home_rebound_rate', 'required_catchup_rate']
+PERIOD_FEATURES_LIST = [
+    'period_1', 'period_2', 'period_3', 'period_4', 'period_5'
+]
+
+VOLATILITY_FEATURES_LIST = [
+    'lead_changes', 'score_volatility'
+]
+
+BASE_FEATURES_LIST = [
+    'score_diff', 'seconds_remaining', 'period', 'home_efg', 'away_efg', 
+    'turnover_diff', 'home_rebound_rate', 'required_catchup_rate',
+    'live_pace', 'score_momentum', 'home_3p_reliance', 'away_3p_reliance'
+] + PERIOD_FEATURES_LIST + VOLATILITY_FEATURES_LIST

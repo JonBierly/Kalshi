@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 from src.models.training import prepare_training_data
 from data.database import DatabaseManager
-from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from spread_src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST, PERIOD_FEATURES_LIST, VOLATILITY_FEATURES_LIST
 
 
 def get_final_score_diffs(X: pd.DataFrame) -> np.ndarray:
@@ -166,15 +166,15 @@ def train_spread_models(n_models=10):
         
         # Predict on bootstrap set to get residuals
         y_pred = mean_model.predict(X_boot)
-        residuals = np.abs(y_boot - y_pred)
+        residuals_sq = (y_boot - y_pred)**2
         
-        # Train std model (predict absolute residuals) with weights
-        std_model = Ridge(alpha=1.0, random_state=i)
-        std_model.fit(X_boot, residuals, sample_weight=sample_weights)
+        # Train variance model (predict squared residuals) with weights
+        variance_model = Ridge(alpha=1.0, random_state=i)
+        variance_model.fit(X_boot, residuals_sq, sample_weight=sample_weights)
         
         ensemble.append({
             'mean_model': mean_model,
-            'std_model': std_model
+            'variance_model': variance_model
         })
         
         # Evaluate on bootstrap set
@@ -190,20 +190,21 @@ def train_spread_models(n_models=10):
     
     # Get predictions from all models
     test_mean_preds = []
-    test_std_preds = []
+    test_variance_preds = []
     
     for model_pair in ensemble:
         mean_pred = model_pair['mean_model'].predict(X_test_features)
-        std_pred = model_pair['std_model'].predict(X_test_features)
+        var_pred = model_pair['variance_model'].predict(X_test_features)
         test_mean_preds.append(mean_pred)
-        test_std_preds.append(std_pred)
+        test_variance_preds.append(var_pred)
     
     test_mean_preds = np.array(test_mean_preds)
-    test_std_preds = np.array(test_std_preds)
+    test_variance_preds = np.array(test_variance_preds)
     
     # Ensemble predictions (of score remainder)
     ensemble_remainder_mean = np.mean(test_mean_preds, axis=0)
-    ensemble_std = np.mean(test_std_preds, axis=0)
+    ensemble_var = np.mean(test_variance_preds, axis=0)
+    ensemble_std = np.sqrt(np.maximum(ensemble_var, 1.0))
     
     # Reconstruct expected final diff = current_diff + predicted_remainder
     reconstructed_final_diff = test_current_diffs + ensemble_remainder_mean

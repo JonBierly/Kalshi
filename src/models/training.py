@@ -5,7 +5,7 @@ from sklearn.metrics import log_loss, accuracy_score
 from sklearn.model_selection import train_test_split
 import xgboost as xgb
 from src.data.database import DatabaseManager
-from src.features.engineering import create_live_features, add_advanced_features, BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from spread_src.features.engineering import create_live_features, add_advanced_features, BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import train_test_split
 

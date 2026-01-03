@@ -26,7 +26,7 @@ from src.models.model_analysis import (
     FeatureCorrelationAnalyzer
 )
 from src.models.training import prepare_training_data
-from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from spread_src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
 
 def main():
     print("=" * 80)

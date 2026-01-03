@@ -18,6 +18,7 @@ import time
 import re
 from datetime import datetime
 from typing import Optional
+import numpy as np
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
@@ -110,6 +111,9 @@ class SimpleLiveTrader:
         
         # Database logging
         self.trade_logger = TradeLogger('data/nba_data.db')
+        
+        # Warm-up tracking
+        self.game_tracking_start = {}  # {game_id: start_time}
         print("✓ Ready")
     
     def run(self, interval: int = 15):
@@ -191,14 +195,20 @@ class SimpleLiveTrader:
         """Evaluate a game and find +EV opportunities."""
         game_id = game['gameId']
         
-        # Setup context
+        # Setup context and use the correct stateful engine for this game
+        if game_id not in self.tracker.feature_engines:
+            from spread_src.features.engineering import FeatureEngine
+            self.tracker.feature_engines[game_id] = FeatureEngine()
+            
         if self.tracker.orch.prediction_engine.current_game_id != game_id:
             self.tracker.orch.setup_game_context(
                 game_id,
                 game['homeTeam']['teamId'],
                 game['awayTeam']['teamId']
             )
-            self.tracker.orch.feature_engine.reset()
+        
+        # Switch the orchestrator to use this game's specific engine
+        self.tracker.orch.feature_engine = self.tracker.feature_engines[game_id]
         
         # Get live data
         live_data = self.tracker.orch.live_client.get_live_game_data(game_id)
@@ -222,20 +232,26 @@ class SimpleLiveTrader:
             home_stats = live_data['homeTeam']['statistics']
             away_stats = live_data['awayTeam']['statistics']
             
-            self.tracker.orch.feature_engine.home_stats = {
+            self.tracker.orch.feature_engine.home_stats.update({
                 'fgm': home_stats.get('fieldGoalsMade', 0),
-                'fga': home_stats.get('fieldGoalsAttempted', 1),  # Avoid div by 0
+                'fga': home_stats.get('fieldGoalsAttempted', 1),
                 'fg3m': home_stats.get('threePointersMade', 0),
                 'to': home_stats.get('turnovers', 0),
-                'reb': home_stats.get('reboundsTotal', 0)
-            }
-            self.tracker.orch.feature_engine.away_stats = {
+                'reb': home_stats.get('reboundsTotal', 0),
+                'pts': live_data['homeTeam']['score'],
+                'fta': home_stats.get('freeThrowsAttempted', 0),
+                'oreb': home_stats.get('reboundsOffensive', 0)
+            })
+            self.tracker.orch.feature_engine.away_stats.update({
                 'fgm': away_stats.get('fieldGoalsMade', 0),
-                'fga': away_stats.get('fieldGoalsAttempted', 1),  # Avoid div by 0
+                'fga': away_stats.get('fieldGoalsAttempted', 1),
                 'fg3m': away_stats.get('threePointersMade', 0),
                 'to': away_stats.get('turnovers', 0),
-                'reb': away_stats.get('reboundsTotal', 0)
-            }
+                'reb': away_stats.get('reboundsTotal', 0),
+                'pts': live_data['awayTeam']['score'],
+                'fta': away_stats.get('freeThrowsAttempted', 0),
+                'oreb': away_stats.get('reboundsOffensive', 0)
+            })
         
         # Extract game info
         home_score = live_data['homeTeam']['score']
@@ -251,27 +267,59 @@ class SimpleLiveTrader:
         
         print(f"\n{away_tri} {away_score} @ {home_tri} {home_score} | {int(total_seconds//60)}:{int(total_seconds%60):02d} left")
         
+        # Track when we first saw this game for warm-up
+        if game_id not in self.game_tracking_start:
+            self.game_tracking_start[game_id] = time.time()
+        
+        # Check warm-up status
+        trader_elapsed = time.time() - self.game_tracking_start[game_id]
+        
+        # Game elapsed: In Q1, we check if 2 mins (120s) have passed. In later periods, it's definitely > 2 mins.
+        if period == 1:
+            game_elapsed = 2880 - total_seconds
+        else:
+            game_elapsed = 9999 # Already past Q1
+            
+        warmed_up = (trader_elapsed >= 120) and (game_elapsed >= 120)
+        
+        if not warmed_up:
+            wait_reason = ""
+            if game_elapsed < 120:
+                wait_reason = f"game clock {int(game_elapsed)}s/120s"
+            if trader_elapsed < 120:
+                trader_reason = f"trader buffer {int(trader_elapsed)}s/120s"
+                wait_reason = f"{wait_reason} and {trader_reason}" if wait_reason else trader_reason
+            print(f"  ⏳ WARM-UP: Waiting for {wait_reason}")
+        
         # Skip late game
         if total_seconds < 120:
             print(f"  ⏰ Skipping: <2 min left")
             return []
         
         # Build features
-        live_features = self._build_features(game, score_diff, total_seconds)
+        live_features = self._build_features(game, score_diff, total_seconds, period)
         
         # Debug: show ALL features being sent to model
         print(f"  === LIVE FEATURES ===")
+        print(f"  Game: pace={live_features.get('live_pace', 0):.1f}, momentum={live_features.get('score_momentum', 0):.1f}, vol={live_features.get('score_volatility', 0):.1f}, lead_swaps={live_features.get('lead_changes', 0)}")
+        print(f"  3P: home={live_features.get('home_3p_reliance', 0):.1%}, away={live_features.get('away_3p_reliance', 0):.1%}")
         print(f"  Base: diff={score_diff:+d}, secs={int(total_seconds)}, home_efg={live_features.get('home_efg', 0):.3f}, away_efg={live_features.get('away_efg', 0):.3f}")
         print(f"        to_diff={live_features.get('turnover_diff', 0):.1f}, reb_rate={live_features.get('home_rebound_rate', 0):.3f}, catchup={live_features.get('required_catchup_rate', 0):.4f}")
-        print(f"  Team: home_off={live_features.get('home_team_recent_off_rtg', 0):.1f}, home_def={live_features.get('home_team_recent_def_rtg', 0):.1f}, home_win={live_features.get('home_team_recent_win_pct', 0):.2f}")
-        print(f"        away_off={live_features.get('away_team_recent_off_rtg', 0):.1f}, away_def={live_features.get('away_team_recent_def_rtg', 0):.1f}, away_win={live_features.get('away_team_recent_win_pct', 0):.2f}")
-        print(f"  Rest: home={live_features.get('home_rest_days', 0):.0f}d, away={live_features.get('away_rest_days', 0):.0f}d")
-        print(f"  Roster: home_pie={live_features.get('home_roster_recent_pie', 0):.3f}, home_off={live_features.get('home_roster_recent_est_off_rating', 0):.1f}, home_def={live_features.get('home_roster_recent_est_def_rating', 0):.1f}")
-        print(f"          away_pie={live_features.get('away_roster_recent_pie', 0):.3f}, away_off={live_features.get('away_roster_recent_est_off_rating', 0):.1f}, away_def={live_features.get('away_roster_recent_est_def_rating', 0):.1f}")
+        print(f"  Team: home_off={live_features.get('home_team_recent_off_rtg', 0):.1f}, home_def={live_features.get('home_team_recent_def_rtg', 0):.1f}, pace={live_features.get('home_team_recent_pace', 0):.1f}")
+        print(f"        away_off={live_features.get('away_team_recent_off_rtg', 0):.1f}, away_def={live_features.get('away_team_recent_def_rtg', 0):.1f}, pace={live_features.get('away_team_recent_pace', 0):.1f}")
+        # Roster features
+        print(f"  Roster: home_pie={live_features.get('home_roster_recent_pie', 0):.3f}, away_pie={live_features.get('away_roster_recent_pie', 0):.3f}")
         
-        # Get model prediction
-        mean_diff, std_diff = self.tracker.predict_spread_distribution(live_features)
-        print(f"  Model: {mean_diff:+.1f} ± {std_diff:.1f}")
+        # Calculate dynamic safety multiplier (1.15x at start -> 1.0x at end)
+        # Total game duration = 48 mins (2880 secs)
+        var_multiplier = 1.0 + (0.15 * min(total_seconds, 2880.0) / 2880.0)
+        print(f"  Safety: var_mult={var_multiplier:.2f}x (linear decay)")
+        
+        # Get model prediction with multiplier
+        params = self.spread_model.predict_distribution_params(live_features, variance_multiplier=var_multiplier)
+        mean_diff = np.mean(params['mean'])
+        std_diff = np.mean(params['std'])
+        print(f"  Model: {mean_diff:+.1f} ± {std_diff:.1f} (adjusted)")
         
         # Evaluate each market
         opportunities = []
@@ -289,11 +337,15 @@ class SimpleLiveTrader:
             except:
                 pass
             
-            # Get model probability with confidence interval
             is_home = (market.team == home_tri)
             threshold = market.spread
             
-            result = self.spread_model.predict_spread_probabilities(live_features, [threshold if is_home else -threshold])
+            # Use the multiplier here as well for consistent probabilities
+            result = self.spread_model.predict_spread_probabilities(
+                live_features, 
+                [threshold if is_home else -threshold],
+                variance_multiplier=var_multiplier
+            )
             
             if is_home:
                 model_prob = result['probabilities'][0]
@@ -349,6 +401,7 @@ class SimpleLiveTrader:
                 # Add game context
                 opp.game_id = game_id
                 opp.seconds_remaining = total_seconds
+                opp.warmed_up = warmed_up
                 opportunities.append(opp)
         
         if opportunities:
@@ -393,6 +446,13 @@ class SimpleLiveTrader:
     def _place_orders(self, opportunities: list):
         """Place new orders for opportunities."""
         if not opportunities:
+            return
+        
+        # Filter for warmed up opportunities
+        ready_opps = [o for o in opportunities if getattr(o, 'warmed_up', False)]
+        if not ready_opps and opportunities:
+            # Only print if we actually have potential opps but they are all warming up
+            print("  (All opportunities suppressed during warm-up)")
             return
         
         open_orders = self.order_mgr.get_open_orders()
@@ -541,29 +601,28 @@ class SimpleLiveTrader:
                 exposure += abs(pos) * cost / 100
         return exposure
     
-    def _build_features(self, game, score_diff, total_seconds) -> dict:
+    def _build_features(self, game, score_diff, total_seconds, period) -> dict:
         """Build feature dict for model."""
-        time_elapsed = 2880 - total_seconds
-        catchup_rate = score_diff / time_elapsed if time_elapsed > 0 else 0
+        # Update history for momentum calculation
+        self.tracker.orch.feature_engine.history.append((total_seconds, score_diff))
+        if len(self.tracker.orch.feature_engine.history) > 1000:
+             self.tracker.orch.feature_engine.history = [h for h in self.tracker.orch.feature_engine.history if h[0] < total_seconds + 600]
+
+        # Use the stateful FeatureEngine to calculate all current features
+        live_features = self.tracker.orch.feature_engine.calculate_current_features(
+            score_diff,
+            total_seconds,
+            period,
+            game['gameId'],
+            game['homeTeam']['teamId'],
+            game['awayTeam']['teamId']
+        )
         
-        features = {
-            'score_diff': score_diff,
-            'seconds_remaining': total_seconds,
-            'required_catchup_rate': catchup_rate,
-            'is_home': 1,
-            'home_efg': self.tracker.orch.feature_engine._calc_efg(self.tracker.orch.feature_engine.home_stats),
-            'away_efg': self.tracker.orch.feature_engine._calc_efg(self.tracker.orch.feature_engine.away_stats),
-            'turnover_diff': self.tracker.orch.feature_engine.home_stats['to'] - self.tracker.orch.feature_engine.away_stats['to'],
-            'home_rebound_rate': self.tracker.orch.feature_engine._calc_reb_rate(
-                self.tracker.orch.feature_engine.home_stats['reb'],
-                self.tracker.orch.feature_engine.away_stats['reb']
-            ),
-            'game_id': game['gameId'],
-            'home_team_id': game['homeTeam']['teamId'],
-            'away_team_id': game['awayTeam']['teamId']
-        }
+        # Combine with context (historical stats + roster stats)
+        full_feats = {**live_features, **self.tracker.orch.prediction_engine.current_game_context}
+        full_feats['is_home'] = 1 # Keep for legacy compatibility
         
-        return {**features, **self.tracker.orch.prediction_engine.current_game_context}
+        return full_feats
     
     def _parse_time(self, period: int, game_clock: str) -> float:
         """Parse game clock to total seconds remaining."""
@@ -665,7 +724,7 @@ def main():
     # API credentials
     kalshi_key_id = "a40ff1c6-12ac-4a6c-9669-ffe12f3de235"
     kalshi_key_path = "key.key"
-    bal = 400
+    bal = 200
     risk_rate = 0.05
     MAX_EXPOSURE = bal * risk_rate
     trader = SimpleLiveTrader(

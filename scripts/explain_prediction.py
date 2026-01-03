@@ -25,7 +25,7 @@ from src.models.model_analysis import (
     PredictionExplainer
 )
 from src.models.training import prepare_training_data
-from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from spread_src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
 from src.data.database import DatabaseManager
 
 def explain_game_prediction(game_id: str, models, feature_cols):
@@ -55,7 +55,7 @@ def explain_game_prediction(game_id: str, models, feature_cols):
     print(f"  Away Team ID: {game_info.iloc[0]['away_team_id']}")
     
     # Get play-by-play and features
-    from src.features.engineering import create_live_features, add_advanced_features
+    from spread_src.features.engineering import create_live_features, add_advanced_features
     
     pbp_query = f"""
     SELECT * FROM pbp_events 

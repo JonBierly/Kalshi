@@ -42,6 +42,10 @@ class SpreadTracker:
         
         # Active matches: (game, spread_markets)
         self.active_matches = []
+        
+        # Stateful feature engines per game_id
+        from spread_src.features.engineering import FeatureEngine
+        self.feature_engines = {}
     
     def setup(self):
         """Match today's NBA games to Kalshi spread markets."""
@@ -149,7 +153,7 @@ class SpreadTracker:
         Returns mean and std of final score differential.
         """
         # Prepare features
-        from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+        from spread_src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
         feature_order = BASE_FEATURES_LIST + ADVANCED_FEATURES_LIST
         row_data = {col: live_features.get(col, 0.0) for col in feature_order}
         X_live = pd.DataFrame([row_data], columns=feature_order)
@@ -205,14 +209,21 @@ class SpreadTracker:
                     game = match['nba_game']
                     spread_markets = match['spread_markets']
                     
-                    # Setup game context
-                    if self.orch.prediction_engine.current_game_id != game['gameId']:
+                    # Setup game context and use correct feature engine
+                    game_id = game['gameId']
+                    if game_id not in self.feature_engines:
+                        from spread_src.features.engineering import FeatureEngine
+                        self.feature_engines[game_id] = FeatureEngine()
+                        
+                    if self.orch.prediction_engine.current_game_id != game_id:
                         self.orch.setup_game_context(
-                            game['gameId'],
+                            game_id,
                             game['homeTeam']['teamId'],
                             game['awayTeam']['teamId']
                         )
-                        self.orch.feature_engine.reset()
+                    
+                    # Switch the orchestrator to use this game's specific engine
+                    self.orch.feature_engine = self.feature_engines[game_id]
                     
                     # Get live data
                     live_data = self.orch.live_client.get_live_game_data(game['gameId'])
@@ -224,20 +235,26 @@ class SpreadTracker:
                     home_stats = live_data['homeTeam']['statistics']
                     away_stats = live_data['awayTeam']['statistics']
                     
-                    self.orch.feature_engine.home_stats = {
+                    self.orch.feature_engine.home_stats.update({
                         'fgm': home_stats['fieldGoalsMade'],
                         'fga': home_stats['fieldGoalsAttempted'],
                         'fg3m': home_stats['threePointersMade'],
                         'to': home_stats['turnovers'],
-                        'reb': home_stats['reboundsTotal']
-                    }
-                    self.orch.feature_engine.away_stats = {
+                        'reb': home_stats['reboundsTotal'],
+                        'pts': live_data['homeTeam']['score'],
+                        'fta': home_stats['freeThrowsAttempted'],
+                        'oreb': home_stats['reboundsOffensive']
+                    })
+                    self.orch.feature_engine.away_stats.update({
                         'fgm': away_stats['fieldGoalsMade'],
                         'fga': away_stats['fieldGoalsAttempted'],
                         'fg3m': away_stats['threePointersMade'],
                         'to': away_stats['turnovers'],
-                        'reb': away_stats['reboundsTotal']
-                    }
+                        'reb': away_stats['reboundsTotal'],
+                        'pts': live_data['awayTeam']['score'],
+                        'fta': away_stats['freeThrowsAttempted'],
+                        'oreb': away_stats['reboundsOffensive']
+                    })
                     
                     # Calculate seconds remaining
                     period = live_data['period']
@@ -252,39 +269,20 @@ class SpreadTracker:
                     if period <= 4:
                         total_seconds += (4 - period) * 720
                     
-                    # Calculate score differential and catchup rate
+                    # Update history and calculate features
                     score_diff = live_data['homeTeam']['score'] - live_data['awayTeam']['score']
-                    
-                    # Required catchup rate: how fast trailing team needs to score to tie
-                    # Negative if home is ahead (away needs to catch up)
-                    # Positive if home is behind (home needs to catch up)
-                    if total_seconds > 0 and score_diff != 0:
-                        # Points per second needed to overcome deficit
-                        time_elapsed = 2880 - total_seconds
-                        if time_elapsed > 0:
-                            points_per_second = score_diff / time_elapsed
-                            required_catchup_rate = points_per_second
-                        else:
-                            required_catchup_rate = 0.0
-                    else:
-                        required_catchup_rate = 0.0
-                    
-                    live_features = {
-                        'score_diff': score_diff,
-                        'seconds_remaining': total_seconds,
-                        'required_catchup_rate': required_catchup_rate,
-                        'is_home': 1,  # Always predicting from home perspective
-                        'home_efg': self.orch.feature_engine._calc_efg(self.orch.feature_engine.home_stats),
-                        'away_efg': self.orch.feature_engine._calc_efg(self.orch.feature_engine.away_stats),
-                        'turnover_diff': self.orch.feature_engine.home_stats['to'] - self.orch.feature_engine.away_stats['to'],
-                        'home_rebound_rate': self.orch.feature_engine._calc_reb_rate(
-                            self.orch.feature_engine.home_stats['reb'],
-                            self.orch.feature_engine.away_stats['reb']
-                        ),
-                        'game_id': game['gameId'],
-                        'home_team_id': game['homeTeam']['teamId'],
-                        'away_team_id': game['awayTeam']['teamId']
-                    }
+                    self.orch.feature_engine.history.append((total_seconds, score_diff))
+                    if len(self.orch.feature_engine.history) > 1000:
+                        self.orch.feature_engine.history = [h for h in self.orch.feature_engine.history if h[0] < total_seconds + 600]
+
+                    live_features = self.orch.feature_engine.calculate_current_features(
+                        score_diff,
+                        total_seconds,
+                        game['gameId'],
+                        game['homeTeam']['teamId'],
+                        game['awayTeam']['teamId']
+                    )
+                    live_features['is_home'] = 1 # Keep for legacy compatibility
                     
                     # Combine with context
                     full_feats = {**live_features, **self.orch.prediction_engine.current_game_context}
@@ -299,6 +297,7 @@ class SpreadTracker:
                     clock = live_data.get('gameClock', '').replace('PT', '').replace('M', ':').replace('S', '')
                     
                     print(f"\n{game['gameCode']}: {score} | Q{period} {clock}")
+                    print(f"Stats: Pace={live_features['live_pace']:.1f}, Momentum={live_features['score_momentum']:.1f}, 3P%={live_features['home_3p_reliance']:.1%}/{live_features['away_3p_reliance']:.1%}")
                     print(f"Model: μ={mean_diff:+.1f}, σ={std_diff:.1f}")
                     print(f"\nSpread Markets:")
                     

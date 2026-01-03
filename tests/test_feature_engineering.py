@@ -1,6 +1,6 @@
 import pandas as pd
 from src.data.acquisition import MockHistoricalDataClient
-from src.features.engineering import create_live_features, FeatureEngine
+from spread_src.features.engineering import create_live_features, FeatureEngine
 
 def test_feature_generation():
     print("Testing Feature Generation...")

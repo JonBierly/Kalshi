@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 
 from src.models.training import prepare_training_data
 from data.database import DatabaseManager
-from src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from spread_src.features.engineering import BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
 
 
 def get_final_score_diffs(X: pd.DataFrame) -> np.ndarray:
@@ -92,6 +92,7 @@ def backtest_spread_bets():
     feature_cols = BASE_FEATURES_LIST + ADVANCED_FEATURES_LIST
     available_cols = [c for c in feature_cols if c in X.columns]
     
+    test_current_diffs = X[test_mask]['score_diff'].values
     X_test = X[test_mask][available_cols]
     y_test = final_diffs[test_mask]
     
@@ -134,13 +135,13 @@ def backtest_spread_bets():
         profit = 0
         
         for i in range(len(X_test)):
-            # Model prediction
-            dist = stats.norm(loc=mean_pred[i], scale=max(std_pred[i], 1.0))
+            # Model prediction: Expected Final Diff = Current Diff + Predicted Remainder
+            recon_mean = test_current_diffs[i] + mean_pred[i]
+            dist = stats.norm(loc=recon_mean, scale=max(std_pred[i], 1.0))
             model_prob = 1 - dist.cdf(threshold)
             
             # Simulate market (assumes some efficiency + noise)
-            # In reality, you'd get this from Kalshi API
-            market_prob = simulate_market_price(y_test.iloc[i], threshold, noise=0.08)
+            market_prob = simulate_market_price(y_test[i], threshold, noise=0.08)
             
             # Edge
             edge = model_prob - market_prob
@@ -150,7 +151,7 @@ def backtest_spread_bets():
                 opportunities += 1
                 
                 # Did we win?
-                actual_diff = y_test.iloc[i]
+                actual_diff = y_test[i]
                 if actual_diff > threshold:
                     wins += 1
                     profit += (1 - market_prob)  # Profit = (1 - price) if win

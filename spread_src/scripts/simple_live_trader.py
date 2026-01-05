@@ -30,6 +30,7 @@ from spread_src.execution.risk_manager import RiskManager
 from spread_src.trading.position_sizer import PositionSizer
 from spread_src.models.spread_model import SpreadDistributionModel
 from spread_src.inference.spread_tracker import SpreadTracker
+from spread_src.features.engineering import add_interaction_features
 from data.kalshi import KalshiClient
 
 
@@ -48,6 +49,7 @@ class SimpleLiveTrader:
         kalshi_key_path: str = 'key.key',
         dry_run: bool = True,
         max_game_exposure: float = 10.0,
+        max_ticker_exposure: float = 3.0,
         min_edge: float = 0.04,
     ):
         """
@@ -58,16 +60,19 @@ class SimpleLiveTrader:
             kalshi_key_path: Path to private key
             dry_run: If True, log orders without executing
             max_game_exposure: Max $ at risk per game (default $10)
+            max_ticker_exposure: Max $ at risk per ticker (default $3)
             min_edge: Minimum edge to trade (default 4%)
         """
         self.dry_run = dry_run
         self.max_game_exposure = max_game_exposure
+        self.max_ticker_exposure = max_ticker_exposure
         
         print("=" * 80)
         print("SIMPLE +EV TRADER")
         print("=" * 80)
         print(f"Mode: {'DRY-RUN (simulation)' if dry_run else 'LIVE (real money!)'}")
         print(f"Max per game: ${max_game_exposure}")
+        print(f"Max per ticker: ${max_ticker_exposure}")
         print(f"Min edge: {min_edge:.0%}")
         print("=" * 80)
         
@@ -102,12 +107,12 @@ class SimpleLiveTrader:
                 event_short = event_prefix.split('-')[-1] if '-' in event_prefix else event_prefix
                 print(f"  {event_short}: {len(tickers)} markets")
         
-        # Load model
-        print("Loading spread model...")
-        self.spread_model = SpreadDistributionModel('models/nba_spread_model.pkl')
+        # Initialize tracker (loads NGBoost model internally)
+        model_path = 'models/nba_spread_ngboost.pkl'
+        self.tracker = SpreadTracker(kalshi_key_id, kalshi_key_path, model_path=model_path)
         
-        # Initialize tracker
-        self.tracker = SpreadTracker(kalshi_key_id, kalshi_key_path)
+        # Reuse the model from tracker
+        self.spread_model = self.tracker.spread_model
         
         # Database logging
         self.trade_logger = TradeLogger('data/nba_data.db')
@@ -310,16 +315,16 @@ class SimpleLiveTrader:
         # Roster features
         print(f"  Roster: home_pie={live_features.get('home_roster_recent_pie', 0):.3f}, away_pie={live_features.get('away_roster_recent_pie', 0):.3f}")
         
-        # Calculate dynamic safety multiplier (1.15x at start -> 1.0x at end)
-        # Total game duration = 48 mins (2880 secs)
-        var_multiplier = 1.0 + (0.15 * min(total_seconds, 2880.0) / 2880.0)
-        print(f"  Safety: var_mult={var_multiplier:.2f}x (linear decay)")
+        # Interaction features for variance
+        enriched = add_interaction_features(live_features)
+        print(f"  Interactions: time_x_margin={enriched.get('time_x_margin', 0):.1f}, log_time={enriched.get('log_time', 0):.2f}, proportion={enriched.get('time_proportion', 0):.2f}")
+        print(f"                close={enriched.get('close_game', 0)}, blowout={enriched.get('blowout', 0)}")
         
-        # Get model prediction with multiplier
-        params = self.spread_model.predict_distribution_params(live_features, variance_multiplier=var_multiplier)
+        # Get model prediction (NGBoost learns uncertainty directly, no manual multiplier needed)
+        params = self.spread_model.predict_distribution_params(live_features)
         mean_diff = np.mean(params['mean'])
         std_diff = np.mean(params['std'])
-        print(f"  Model: {mean_diff:+.1f} ± {std_diff:.1f} (adjusted)")
+        print(f"  Model: {mean_diff:+.1f} ± {std_diff:.1f}")
         
         # Evaluate each market
         opportunities = []
@@ -340,11 +345,10 @@ class SimpleLiveTrader:
             is_home = (market.team == home_tri)
             threshold = market.spread
             
-            # Use the multiplier here as well for consistent probabilities
+            # Get probabilities from model
             result = self.spread_model.predict_spread_probabilities(
                 live_features, 
-                [threshold if is_home else -threshold],
-                variance_multiplier=var_multiplier
+                [threshold if is_home else -threshold]
             )
             
             if is_home:
@@ -355,6 +359,20 @@ class SimpleLiveTrader:
                 model_prob = 1 - result['probabilities'][0]
                 ci_lower = 1 - result['ci_90_upper'][0]
                 ci_upper = 1 - result['ci_90_lower'][0]
+            
+            # Log prediction for every market evaluated (regardless of trade)
+            self.trade_logger.log_prediction(
+                game_id=game_id,
+                ticker=market.ticker,
+                seconds_remaining=int(total_seconds),
+                score_diff=score_diff,
+                predicted_prob=model_prob,
+                ci_lower=ci_lower,
+                ci_upper=ci_upper,
+                bid_price=market.yes_bid,
+                ask_price=market.yes_ask,
+                features=live_features
+            )
             
             # Calculate edge using beat-by-1 prices (same as trading logic)
             # BUY at bid+1, edge = ci_lower - buy_price
@@ -498,8 +516,8 @@ class SimpleLiveTrader:
             event_short = event_prefix.split('-')[-1] if '-' in event_prefix else event_prefix
             print(f"\n  Event {event_short}: Current exposure ${game_exposure:.2f} / ${self.max_game_exposure:.2f}")
             
-            # Sort by EV
-            event_opps.sort(key=lambda x: x.ev_cents, reverse=True)
+            # Sort by Edge (percentage) to prioritize best deals
+            event_opps.sort(key=lambda x: x.edge, reverse=True)
             
             for opp in event_opps:
                 market_name = opp.ticker[-10:]
@@ -508,6 +526,23 @@ class SimpleLiveTrader:
                 if (opp.ticker, opp.action) in existing:
                     print(f"    {market_name} {opp.action.upper()}: Already have order, skipping")
                     continue
+                
+                # Calculate current exposure for THIS TICKER specifically
+                ticker_exposure = 0.0
+                pos = self.portfolio.positions.get(opp.ticker, 0)
+                if pos != 0:
+                    cost = self.portfolio.cost_basis.get(opp.ticker, 50.0)
+                    if pos > 0:
+                        ticker_exposure = (cost / 100.0) * pos
+                    else:
+                        ticker_exposure = ((100 - cost) / 100.0) * abs(pos)
+                
+                # Add PENDING orders for this ticker
+                for order in open_orders:
+                    if order.ticker == opp.ticker:
+                        ticker_exposure += self.risk_mgr._calculate_order_exposure(
+                            order.side, order.price, order.size, pos
+                        )
                 
                 # Calculate potential exposure change from this order
                 current_pos = self.portfolio.positions.get(opp.ticker, 0)
@@ -528,17 +563,25 @@ class SimpleLiveTrader:
                 else:
                     # Position-increasing: check exposure limit first
                     if game_exposure >= self.max_game_exposure:
-                        print(f"    {market_name} {opp.action.upper()}: BLOCKED - exposure ${game_exposure:.2f} >= ${self.max_game_exposure:.2f}")
+                        print(f"    {market_name} {opp.action.upper()}: BLOCKED - game exposure ${game_exposure:.2f} >= ${self.max_game_exposure:.2f}")
+                        continue
+                    
+                    if ticker_exposure >= self.max_ticker_exposure:
+                        print(f"    {market_name} {opp.action.upper()}: BLOCKED - ticker exposure ${ticker_exposure:.2f} >= ${self.max_ticker_exposure:.2f}")
                         continue
                     
                     # Use Kelly criterion for sizing with conservative CI bounds
-                    remaining_exposure = self.max_game_exposure - game_exposure
+                    # Combined budget: whichever is smaller
+                    remaining_game = self.max_game_exposure - game_exposure
+                    remaining_ticker = self.max_ticker_exposure - ticker_exposure
+                    bankroll = min(remaining_game, remaining_ticker)
+                    
                     fair_value = opp.model_prob * 100
                     
                     size = self.position_sizer.calculate_size(
                         fair_value=fair_value,
                         price=opp.price,
-                        bankroll=remaining_exposure,
+                        bankroll=bankroll,
                         action=opp.action,
                         ci_lower=opp.ci_lower,
                         ci_upper=opp.ci_upper,

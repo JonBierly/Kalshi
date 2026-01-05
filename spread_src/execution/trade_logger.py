@@ -8,6 +8,7 @@ import sqlite3
 from datetime import datetime, date
 from typing import Optional, Dict
 import os
+import json
 
 
 class TradeLogger:
@@ -70,10 +71,13 @@ class TradeLogger:
         ''')
         
         # Table 2: Model Predictions
+        # Drop and recreate to ensure clean schema transition as requested
+        cursor.execute('DROP TABLE IF EXISTS model_predictions')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS model_predictions (
                 prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+                timestamp_local TEXT,
                 
                 -- Game context
                 game_id TEXT NOT NULL,
@@ -87,6 +91,13 @@ class TradeLogger:
                 predicted_prob REAL,
                 ci_lower REAL,
                 ci_upper REAL,
+                
+                -- Market data
+                bid_price REAL,
+                ask_price REAL,
+                
+                -- Features
+                features_json TEXT,
                 
                 -- Outcome
                 actual_outcome BOOLEAN,
@@ -274,10 +285,13 @@ class TradeLogger:
         score_diff: int,
         predicted_prob: float,
         ci_lower: float,
-        ci_upper: float
+        ci_upper: float,
+        bid_price: Optional[float] = None,
+        ask_price: Optional[float] = None,
+        features: Optional[dict] = None
     ) -> int:
         """
-        Log model prediction.
+        Log model prediction with full context.
         
         Returns:
             prediction_id
@@ -285,13 +299,18 @@ class TradeLogger:
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         
+        timestamp_local = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        features_json = json.dumps(features) if features else None
+        
         cursor.execute('''
             INSERT INTO model_predictions (
                 game_id, ticker, seconds_remaining, actual_score_diff,
-                predicted_prob, ci_lower, ci_upper
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                predicted_prob, ci_lower, ci_upper,
+                bid_price, ask_price, features_json, timestamp_local
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (game_id, ticker, seconds_remaining, score_diff,
-              predicted_prob, ci_lower, ci_upper))
+              predicted_prob, ci_lower, ci_upper,
+              bid_price, ask_price, features_json, timestamp_local))
         
         prediction_id = cursor.lastrowid
         conn.commit()

@@ -14,6 +14,10 @@ class TeamStatsEngine:
         self.raw_df = self._load_data()
         self.features_df = self._compute_rolling_features()
         self.latest_team_stats = self._compute_latest_stats()
+        # PRE-CACHE for fast lookup: (game_id, team_id) -> row
+        self._cache = {}
+        for _, row in self.features_df.iterrows():
+            self._cache[(row['game_id'], row['team_id'])] = row.to_dict()
         
     def _load_data(self):
         """Loads all team basic stats sorted by date."""
@@ -159,23 +163,19 @@ class TeamStatsEngine:
         return stats
 
     def get_features(self, game_id, home_team_id, away_team_id):
-        """Returns a dict of features for the game."""
-        # Look up home team row
-        home_row = self.features_df[(self.features_df['game_id'] == game_id) & (self.features_df['team_id'] == home_team_id)]
-        away_row = self.features_df[(self.features_df['game_id'] == game_id) & (self.features_df['team_id'] == away_team_id)]
+        """Returns a dict of features for the game (OPTIMIZED)."""
+        home_row = self._cache.get((game_id, home_team_id))
+        away_row = self._cache.get((game_id, away_team_id))
         
         feat_dict = {}
-        
-        if not home_row.empty:
-            for col in home_row.columns:
+        if home_row:
+            for col, val in home_row.items():
                 if col not in ['game_id', 'team_id', 'game_date']:
-                    feat_dict[f'home_{col}'] = home_row.iloc[0][col]
-                    
-        if not away_row.empty:
-            for col in away_row.columns:
+                    feat_dict[f'home_{col}'] = val
+        if away_row:
+            for col, val in away_row.items():
                 if col not in ['game_id', 'team_id', 'game_date']:
-                    feat_dict[f'away_{col}'] = away_row.iloc[0][col]
-                    
+                    feat_dict[f'away_{col}'] = val
         return feat_dict
 
         return feat_dict
@@ -189,6 +189,41 @@ class RosterEngine:
         self.raw_df = self._load_data()
         self.player_features = self._compute_player_rolling_features()
         self.latest_player_stats = self._compute_latest_player_stats()
+        # PRE-CACHE
+        print("Caching roster features...")
+        self._cache = {}
+        # Group by game and team once
+        for (gid, tid), group in self.player_features.groupby(['game_id', 'team_id']):
+            # We still need the weighting logic, but we can pre-calculate it for each game-team once
+            self._cache[(gid, tid)] = self._precalc_roster_stats(group)
+    
+    def _precalc_roster_stats(self, team_p):
+        """Internal helper to calculate weighted stats for a group of players."""
+        item = {}
+        # Season Stats
+        season_cols = [c for c in team_p.columns if 'player_season_' in c and 'min_float' not in c]
+        season_weights = team_p['player_season_min_float'].fillna(0)
+        if season_weights.sum() > 0:
+            for col in season_cols:
+                metric_name = col.replace('player_', 'roster_')
+                valid = team_p[col].notna()
+                if valid.sum() > 0:
+                    w = season_weights[valid]
+                    if w.sum() > 0:
+                        item[metric_name] = np.average(team_p.loc[valid, col], weights=w)
+        
+        # Recent Stats
+        recent_cols = [c for c in team_p.columns if 'player_recent_' in c and 'min_float' not in c]
+        recent_weights = team_p['player_recent_min_float'].fillna(0)
+        if recent_weights.sum() > 0:
+            for col in recent_cols:
+                metric_name = col.replace('player_', 'roster_')
+                valid = team_p[col].notna()
+                if valid.sum() > 0:
+                    w = recent_weights[valid]
+                    if w.sum() > 0:
+                        item[metric_name] = np.average(team_p.loc[valid, col], weights=w)
+        return item
         
     def _load_data(self):
         """Loads all player advanced stats sorted by date."""
@@ -288,72 +323,15 @@ class RosterEngine:
         return pd.DataFrame(list(latest_stats_dict.values()))
         
     def get_features(self, game_id, home_team_id, away_team_id):
-        """Aggregates player stats for the specific game."""
-        game_players = self.player_features[self.player_features['game_id'] == game_id]
+        """Returns aggregated player stats for the game (OPTIMIZED)."""
+        home_feats = self._cache.get((game_id, home_team_id), {})
+        away_feats = self._cache.get((game_id, away_team_id), {})
         
-        if game_players.empty:
-            return {}
-            
         feat_dict = {}
-        
-        for team_id, prefix in [(home_team_id, 'home'), (away_team_id, 'away')]:
-            team_p = game_players[game_players['team_id'] == team_id]
-            
-            if team_p.empty:
-                continue
-                
-            # Weighted Average by HISTORICAL Minutes
-            # We use player_season_min_float for season stats
-            # We use player_recent_min_float for recent stats
-            
-            # Season Stats
-            season_cols = [c for c in team_p.columns if 'player_season_' in c and 'min_float' not in c]
-            season_weights = team_p['player_season_min_float'].fillna(0)
-            total_season_min = season_weights.sum()
-            
-            if total_season_min > 0:
-                for col in season_cols:
-                    metric_name = col.replace('player_', 'roster_')
-                    # Weighted average ignoring NaNs in the metric itself
-                    valid = team_p[col].notna()
-                    if valid.sum() > 0:
-                        # Re-normalize weights for valid rows
-                        w = season_weights[valid]
-                        if w.sum() > 0:
-                            val = np.average(team_p.loc[valid, col], weights=w)
-                            feat_dict[f'{prefix}_{metric_name}'] = val
-                        else:
-                            feat_dict[f'{prefix}_{metric_name}'] = 0.0
-                    else:
-                        feat_dict[f'{prefix}_{metric_name}'] = 0.0
-            else:
-                # If no history, 0
-                for col in season_cols:
-                    metric_name = col.replace('player_', 'roster_')
-                    feat_dict[f'{prefix}_{metric_name}'] = 0.0
-
-            # Recent Stats
-            recent_cols = [c for c in team_p.columns if 'player_recent_' in c and 'min_float' not in c]
-            recent_weights = team_p['player_recent_min_float'].fillna(0)
-            total_recent_min = recent_weights.sum()
-            
-            if total_recent_min > 0:
-                for col in recent_cols:
-                    metric_name = col.replace('player_', 'roster_')
-                    valid = team_p[col].notna()
-                    if valid.sum() > 0:
-                        w = recent_weights[valid]
-                        if w.sum() > 0:
-                            val = np.average(team_p.loc[valid, col], weights=w)
-                            feat_dict[f'{prefix}_{metric_name}'] = val
-                        else:
-                            feat_dict[f'{prefix}_{metric_name}'] = 0.0
-                    else:
-                        feat_dict[f'{prefix}_{metric_name}'] = 0.0
-            else:
-                for col in recent_cols:
-                    metric_name = col.replace('player_', 'roster_')
-                    feat_dict[f'{prefix}_{metric_name}'] = 0.0
+        for k, v in home_feats.items():
+            feat_dict[f'home_{k}'] = v
+        for k, v in away_feats.items():
+            feat_dict[f'away_{k}'] = v
         return feat_dict
 
     def get_projected_roster_features(self, team_id, player_ids=None):
@@ -658,8 +636,57 @@ VOLATILITY_FEATURES_LIST = [
     'lead_changes', 'score_volatility'
 ]
 
+# Interaction features for variance prediction
+# These help NGBoost learn that variance depends on BOTH time and margin
+INTERACTION_FEATURES_LIST = [
+    'time_x_margin', 'time_x_abs_margin', 'margin_squared',
+    'log_time', 'time_proportion', 'close_game', 'blowout'
+]
+
 BASE_FEATURES_LIST = [
     'score_diff', 'seconds_remaining', 'period', 'home_efg', 'away_efg', 
     'turnover_diff', 'home_rebound_rate', 'required_catchup_rate',
     'live_pace', 'score_momentum', 'home_3p_reliance', 'away_3p_reliance'
 ] + PERIOD_FEATURES_LIST + VOLATILITY_FEATURES_LIST
+
+
+def add_interaction_features(df_or_dict):
+    """
+    Add interaction features for variance prediction.
+    
+    Works with both DataFrames (for training) and dicts (for inference).
+    
+    Args:
+        df_or_dict: Either a pandas DataFrame or a dict of features
+        
+    Returns:
+        Same type as input with interaction features added
+    """
+    if isinstance(df_or_dict, dict):
+        # Dict case (inference)
+        result = dict(df_or_dict)
+        score_diff = result.get('score_diff', 0.0)
+        seconds = result.get('seconds_remaining', 0.0)
+        
+        result['time_x_margin'] = seconds * score_diff
+        result['time_x_abs_margin'] = seconds * abs(score_diff)
+        result['margin_squared'] = score_diff ** 2
+        result['log_time'] = np.log1p(seconds)
+        result['time_proportion'] = seconds / 2880.0
+        result['close_game'] = 1.0 if abs(score_diff) <= 10 else 0.0
+        result['blowout'] = 1.0 if abs(score_diff) >= 20 else 0.0
+        
+        return result
+    else:
+        # DataFrame case (training)
+        df = df_or_dict.copy()
+        
+        df['time_x_margin'] = df['seconds_remaining'] * df['score_diff']
+        df['time_x_abs_margin'] = df['seconds_remaining'] * np.abs(df['score_diff'])
+        df['margin_squared'] = df['score_diff'] ** 2
+        df['log_time'] = np.log1p(df['seconds_remaining'])
+        df['time_proportion'] = df['seconds_remaining'] / 2880.0
+        df['close_game'] = (np.abs(df['score_diff']) <= 10).astype(float)
+        df['blowout'] = (np.abs(df['score_diff']) >= 20).astype(float)
+        
+        return df

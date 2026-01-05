@@ -7,18 +7,27 @@ from spread_src.features.engineering import TeamStatsEngine, RosterEngine, Featu
 from src.models.prediction import PredictionEngine
 
 class LiveGameOrchestrator:
-    def __init__(self, client=None, model_type='lr'):
+    def __init__(self, client=None, model_type='lr', skip_model=False):
         """
         Initialize live game orchestrator.
         
         Args:
             client: Optional LiveClient instance
             model_type: 'lr' or 'xgboost' for model selection (default: 'lr')
+            skip_model: If True, skip loading prediction model (for spread trading)
         """
         self.live_client = client if client else LiveClient()
         self.team_engine = TeamStatsEngine()
         self.roster_engine = RosterEngine()
-        self.prediction_engine = PredictionEngine(model_type=model_type)
+        if not skip_model:
+            self.prediction_engine = PredictionEngine(model_type=model_type)
+        else:
+            # Create a minimal prediction engine stand-in for context storage
+            class MinimalPredictionEngine:
+                def __init__(self):
+                    self.current_game_context = {}
+                    self.current_game_id = None
+            self.prediction_engine = MinimalPredictionEngine()
         self.feature_engine = FeatureEngine()
 
         

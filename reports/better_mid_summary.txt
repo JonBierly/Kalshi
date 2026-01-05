@@ -1,0 +1,16 @@
+
+'Better Mid' Analysis Summary
+============================
+This analysis isolates cases where the model FAIR PRICE sits BETWEEN the market bid and ask.
+Goal: Determine if the model is a better estimator of the true probability than the simple mid-price.
+
+Key Results:
+           model_brier  market_brier  n_obs  improvement
+width_bin                                               
+0-5c          0.056704      0.056774   1010     0.122635
+5-10c         0.108148      0.107484    695    -0.618192
+10-20c        0.109488      0.108724    829    -0.702594
+20-40c        0.191659      0.177855    739    -7.761523
+40c+          0.100630      0.183524    225    45.167747
+
+Observations where Model is more accurate than Mid: 1989 / 3498

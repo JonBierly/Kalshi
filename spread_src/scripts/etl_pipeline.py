@@ -1,3 +1,9 @@
+import sys
+from pathlib import Path
+
+# Add project root to path for imports
+project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(project_root))
 
 from data.acquisition import HistoricalDataClient
 from data.database import DatabaseManager, Game
@@ -57,8 +63,15 @@ def run_backfill(seasons=['2025-26'], limit=None):
                 continue
 
 if __name__ == "__main__":
-    # Run for both seasons. 
-    # WARNING: This will take a long time (hours) for full seasons.
-    # For demonstration, we'll limit to 10 games per season.
-    # User can remove limit=10 to run full backfill.
-    run_backfill(limit=None)
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Backfill game play-by-play data for specified seasons.')
+    parser.add_argument('--seasons', nargs='+', default=['2024-25', '2025-26'],
+                        help='List of seasons to backfill (e.g., --seasons 2024-25 2025-26)')
+    parser.add_argument('--limit', type=int, default=None,
+                        help='Limit number of games per season (for testing)')
+    
+    args = parser.parse_args()
+    
+    print(f"Running backfill for seasons: {args.seasons}")
+    run_backfill(seasons=args.seasons, limit=args.limit)

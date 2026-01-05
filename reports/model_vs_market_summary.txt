@@ -1,0 +1,16 @@
+
+Model vs Market Comparison Summary (Precise Anchors)
+==================================================
+Observations: 11340
+Unique Markets: 501
+Unique Games: 47
+
+Mean Brier Scores (All):
+- Model:  0.1713
+- Market: 0.1413
+
+Trade Analysis:
+- Signals Found: 7842 (69.2% of observations)
+- Avg Captured Edge: 0.1651
+- Model Brier (on Signals): 0.1982 if trade_count > 0 else "N/A"
+- Market Brier (on Signals): 0.1540 if trade_count > 0 else "N/A"

@@ -130,6 +130,44 @@ class KalshiClient:
         except Exception as e:
             print(f"Error fetching orderbook for {ticker}: {e}")
             return None
+
+    def get_candlesticks(self, ticker, start_ts=None, end_ts=None, interval=1):
+        """
+        Get candlesticks for a market.
+        
+        Args:
+            ticker: Market ticker
+            start_ts: Start Unix timestamp (seconds)
+            end_ts: End Unix timestamp (seconds)
+            interval: Interval in minutes (1, 5, 15, 30, 60, 1440)
+            
+        Returns:
+            List of candlestick dicts
+        """
+        # Determine series ticker from market ticker
+        # Example: KXNBASPREAD-26JAN03BOSLAC-LAC8 -> KXNBASPREAD
+        series_ticker = ticker.split('-')[0]
+        
+        endpoint = f"/series/{series_ticker}/markets/{ticker}/candlesticks"
+        path = f"/trade-api/v2/series/{series_ticker}/markets/{ticker}/candlesticks"
+        
+        params = {"period_interval": interval}
+        if start_ts:
+            params['start_ts'] = int(start_ts)
+        if end_ts:
+            params['end_ts'] = int(end_ts)
+            
+        headers = self._get_headers("GET", path)
+        
+        try:
+            response = requests.get(f"{self.base_url}{endpoint}", headers=headers, params=params)
+            response.raise_for_status()
+            return response.json().get('candlesticks', [])
+        except Exception as e:
+            print(f"Error fetching candlesticks for {ticker}: {e}")
+            if 'response' in locals():
+                print(f"Response: {response.text}")
+            return []
     
     # ==================== ORDER MANAGEMENT ====================
     

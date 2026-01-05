@@ -76,8 +76,12 @@ class PositionSizer:
         if price < 1 or price > 99 or bankroll < 0.10:
             return min_size
         
-        # Kelly percentage: f = (edge/100) / (price/100)
-        kelly_pct = (edge / 100.0) / (price / 100.0)
+        # Kelly percentage: f = (edge / 100) / ((100 - price) / 100) for a binary contract
+        # Standard binary Kelly: f = (p * b - q) / b where b is odds-1
+        # Here odds = 100/price, so b = (100-price)/price
+        # Kelly: (p * (100-price)/price - (1-p)) / ((100-price)/price)
+        # Simplified: (edge / price) / ((100-price) / price) = edge / (100 - price)
+        kelly_pct = (edge / (100.0 - price))
         
         # Apply kelly fraction
         kelly_pct = self._adjust_for_uncertainty(kelly_pct, ci_width)

@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NBA Spread Dashboard</title>
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Outfit:wght@400;600;700&display=swap"
+        rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-plugin-annotation@2.0.1"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jstat/1.9.6/jstat.min.js"></script>
+</head>
+
+<body>
+    <div class="glow-container">
+        <div class="glow-ball" style="top: -10%; left: -10%;"></div>
+        <div class="glow-ball" style="bottom: -10%; right: -10%; background: rgba(0, 102, 255, 0.2);"></div>
+    </div>
+
+    <header>
+        <div class="header-left">
+            <h1>NBA Spread <span>Trader</span></h1>
+            <div id="status-badge" class="badge">Live</div>
+        </div>
+        <div class="header-right" id="portfolio-stats">
+            <div class="stat-box">
+                <span class="label">Exposure</span>
+                <span id="stat-exposure" class="value">$0.00</span>
+            </div>
+            <div class="stat-box">
+                <span class="label">Cash</span>
+                <span id="stat-cash" class="value">$0.00</span>
+            </div>
+    </header>
+
+    <nav class="tabs" id="game-tabs">
+        <!-- Tabs will be injected here -->
+    </nav>
+
+    <main id="games-container">
+        <!-- Games will be injected here -->
+        <div class="loading-state">
+            <div class="spinner"></div>
+            <p>Waiting for trader to start...</p>
+        </div>
+    </main>
+
+    <script src="/static/js/dashboard.js"></script>
+</body>
+
+</html>

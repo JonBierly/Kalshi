@@ -169,37 +169,53 @@ class RiskManager:
         Returns:
             Exposure delta in dollars (negative = reduces exposure)
         """
-        # Check if this order reduces position
-        is_reducing = False
-        if side == 'buy' and current_position < 0:  # Buying to cover short
-            is_reducing = True
-        elif side == 'sell' and current_position > 0:  # Selling to reduce long
-            is_reducing = True
+        return self.get_exposure_delta(side, price, size, current_position)
+
+    def get_exposure_delta(self, side: str, price: float, size: int, current_position: int) -> float:
+        """
+        Correctly calculates the change in exposure ($ at risk) for an order.
         
-        if side == 'buy':
-            # Buying YES = pay price
-            exposure = (price / 100.0) * size
-        else:  # sell
-            # Selling YES = margin is (100 - price)
-            exposure = ((100 - price) / 100.0) * size
+        Exposure is the maximum capital we can lose.
+        - Long YES: Exposure = price/100 * size
+        - Short YES: Exposure = (100-price)/100 * size
         
-        # If reducing position, this actually DECREASES exposure
-        if is_reducing:
-            # Calculate actual exposure reduction
-            reduction_size = min(size, abs(current_position))
-            if reduction_size > 0:
-                # The portion that closes position reduces exposure
+        If we are closing, we 'recuperate' our current exposure.
+        Since we don't always know the cost basis here, we estimate it using the current price
+        unless it's passed in. For safety, this matches Kalshi's margin requirement logic.
+        """
+        is_closing = (side == 'buy' and current_position < 0) or (side == 'sell' and current_position > 0)
+        
+        if not is_closing:
+            # Simple opening order
+            if side == 'buy':
+                return (price / 100.0) * size
+            else:
+                return ((100 - price) / 100.0) * size
+        else:
+            # Position reducing order
+            # The part that closes the position has NEGATIVE exposure (reduces total)
+            # The part that (potentially) flips the position becomes new opening exposure
+            
+            contracts_to_close = min(size, abs(current_position))
+            contracts_to_open = max(0, size - abs(current_position))
+            
+            # Exposure reduction from closing
+            # We assume our current exposure is roughly (100-price) for short, (price) for long
+            if side == 'buy': # Closing short
+                reduction = -((100 - price) / 100.0) * contracts_to_close
+            else: # Closing long
+                reduction = -(price / 100.0) * contracts_to_close
+            
+            # Exposure addition from opening (if we flip)
+            if contracts_to_open > 0:
                 if side == 'buy':
-                    # Closing short: reduces margin requirement
-                    reduction = ((100 - price) / 100.0) * reduction_size
+                    addition = (price / 100.0) * contracts_to_open
                 else:
-                    # Closing long: frees up capital
-                    reduction = (price / 100.0) * reduction_size
+                    addition = ((100 - price) / 100.0) * contracts_to_open
+            else:
+                addition = 0.0
                 
-                # Net exposure change
-                exposure = exposure - reduction
-        
-        return exposure
+            return reduction + addition
 
     
     def _extract_game_id(self, ticker: str) -> str:

@@ -36,6 +36,7 @@ class Portfolio:
         
         # Trade history (for logging)
         self.trade_history = []
+        self.last_fill_time: Dict[str, datetime] = {}
     
     def get_live_state(self, kalshi_client):
         """
@@ -178,7 +179,7 @@ class Portfolio:
         
         # Update cache
         self.cash = state['balance']
-        self.positions = state['positions']
+        self.positions = state['positions']  # Ground truth from Kalshi
         self.cost_basis = state['cost_basis']
         
         # Calculate realized P&L from Kalshi
@@ -188,7 +189,6 @@ class Portfolio:
         print(f"  Cash: ${self.cash:.2f}")
         print(f"  Positions: {len(self.positions)}")
         print(f"  Exposure: ${state['exposure']:.2f}")
-        print(f"  Realized P&L: ${self.realized_pnl:+.2f}")
     
     def get_realized_pnl(self, kalshi_client, since_timestamp=None):
         """
@@ -249,17 +249,20 @@ class Portfolio:
         if timestamp is None:
             timestamp = datetime.now()
         
+        self.last_fill_time[ticker] = timestamp
+        
         # Update position
         current_pos = self.positions.get(ticker, 0)
         
         if side == 'buy':
-            new_pos = current_pos + size
             cash_flow = -(price / 100.0) * size  # You pay
         else:  # sell
-            new_pos = current_pos - size
             cash_flow = (price / 100.0) * size  # You receive
         
-        self.positions[ticker] = new_pos
+        # CRITICAL BUG FIX: Do NOT update self.positions here.
+        # trusted positions must ONLY come from refresh_state (Kalshi API).
+        # Otherwise we double-count when refresh_state runs right after a fill.
+        
         self.cash += cash_flow
         
         # Update cost basis
@@ -267,10 +270,12 @@ class Portfolio:
         
         # Log fill to database
         if trade_id:
+            # We don't have the new_pos easily here anymore without querying API,
+            # but we can omit it or log it as -1/None for now.
             self.logger.log_order_filled(
                 trade_id=trade_id,
                 fill_price=price,
-                position_after=new_pos,
+                position_after=0, # Placeholder, ground truth in refresh_state
                 timestamp=timestamp
             )
         
@@ -281,12 +286,10 @@ class Portfolio:
             'side': side,
             'price': price,
             'size': size,
-            'position_after': new_pos,
             'cash_after': self.cash
         })
         
         print(f"Fill: {side.upper()} {size} {ticker} @ {price}¢")
-        print(f"  Position: {current_pos} → {new_pos}")
         print(f"  Cash: ${self.cash:.2f}")
     
     def _update_cost_basis(self, ticker: str, side: str, price: float, size: int, old_pos: int):
@@ -350,10 +353,7 @@ class Portfolio:
         # Clear position
         self.positions[ticker] = 0
         
-        print(f"\nSettled {ticker}: {'YES' if outcome else 'NO'}")
-        print(f"  Position: {position} → 0")
         print(f"  Payout: ${payout:.2f}")
-        print(f"  Realized P&L: ${realized:+.2f}")
     
     def settle_unsettled_trades(self, kalshi_client, trade_logger):
         """
@@ -566,7 +566,6 @@ class Portfolio:
         lines = ["\n=== PORTFOLIO ==="]
         lines.append(f"Cash: ${self.cash:.2f}")
         lines.append(f"Exposure: ${self.get_exposure():.2f}")
-        lines.append(f"Realized P&L: ${self.realized_pnl:+.2f}")
         lines.append(f"\nPositions:")
         
         if not self.positions or all(p == 0 for p in self.positions.values()):

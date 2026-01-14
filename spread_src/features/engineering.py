@@ -353,8 +353,10 @@ class RosterEngine:
         if player_ids:
             # Filter for provided players
             active_players = team_players[team_players['player_id'].isin(player_ids)]
+            print(f"  [RosterEngine] Using {len(active_players)} live player IDs for team {team_id}")
         else:
             # Fallback: Top 10 by recent minutes
+            print(f"  [RosterEngine] WARNING: No player IDs provided for team {team_id}. Falling back to top 10 players.")
             active_players = team_players.sort_values('player_recent_min_float', ascending=False).head(10)
             
         if active_players.empty:

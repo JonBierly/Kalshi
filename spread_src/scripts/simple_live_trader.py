@@ -16,9 +16,11 @@ import os
 import sys
 import time
 import re
+import json
 from datetime import datetime
-from typing import Optional
+from typing import Optional, List
 import numpy as np
+import pandas as pd
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
@@ -80,12 +82,12 @@ class SimpleLiveTrader:
         print("\n✓ Initializing...")
         
         self.kalshi = KalshiClient(kalshi_key_id, kalshi_key_path)
-        self.portfolio = Portfolio(max_exposure=max_game_exposure * 10)  # Allow 10 games
+        self.portfolio = Portfolio(max_exposure=max_game_exposure * 12)  # Allow 12 games
         self.portfolio.refresh_state(self.kalshi)
         
         self.order_mgr = OrderManager(self.kalshi, dry_run=dry_run)
         self.trader = SimpleEdgeTrader(min_edge=min_edge, cancel_threshold=0.02)
-        self.risk_mgr = RiskManager(max_game_exposure * 10, max_game_exposure)
+        self.risk_mgr = RiskManager(max_game_exposure * 12, max_game_exposure)
         self.position_sizer = PositionSizer(kelly_fraction=0.25)  # Quarter-Kelly
         
         # CRITICAL: Build event_tickers map from synced positions
@@ -121,7 +123,7 @@ class SimpleLiveTrader:
         self.game_tracking_start = {}  # {game_id: start_time}
         print("✓ Ready")
     
-    def run(self, interval: int = 15):
+    def run(self, interval: int = 10):
         """Main trading loop."""
         print("\nMatching games to spread markets...")
         self.tracker.setup()
@@ -174,6 +176,9 @@ class SimpleLiveTrader:
                 
                 # Place new orders
                 self._place_orders(all_opportunities)
+                
+                # Export Dashboard State
+                self._export_dashboard_state()
                 
                 # Print status
                 self._print_status()
@@ -289,10 +294,10 @@ class SimpleLiveTrader:
         
         if not warmed_up:
             wait_reason = ""
-            if game_elapsed < 120:
-                wait_reason = f"game clock {int(game_elapsed)}s/120s"
-            if trader_elapsed < 120:
-                trader_reason = f"trader buffer {int(trader_elapsed)}s/120s"
+            if game_elapsed < 60:
+                wait_reason = f"game clock {int(game_elapsed)}s/60s"
+            if trader_elapsed < 60:
+                trader_reason = f"trader buffer {int(trader_elapsed)}s/60s"
                 wait_reason = f"{wait_reason} and {trader_reason}" if wait_reason else trader_reason
             print(f"  ⏳ WARM-UP: Waiting for {wait_reason}")
         
@@ -644,6 +649,129 @@ class SimpleLiveTrader:
                 exposure += abs(pos) * cost / 100
         return exposure
     
+    def _export_dashboard_state(self):
+        """Export current state for dashboard visualization."""
+        state = {
+            "timestamp": datetime.now().isoformat(),
+            "portfolio": {
+                "cash": self.portfolio.cash,
+                "realized_pnl": self.portfolio.realized_pnl,
+                "exposure": self.portfolio.get_exposure(),
+                "positions": self.portfolio.positions,
+                "cost_basis": self.portfolio.cost_basis
+            },
+            "open_orders": [
+                {
+                    "ticker": o.ticker,
+                    "side": o.side,
+                    "price": o.price,
+                    "size": o.size
+                } for o in self.order_mgr.get_open_orders()
+            ],
+            "games": []
+        }
+        
+        for match in self.tracker.active_matches:
+            game = match['nba_game']
+            game_id = game['gameId']
+            
+            # Use cached prediction data
+            live_data = self.tracker.orch.live_client.get_live_game_data(game_id)
+            if not live_data:
+                continue
+                
+            home_score = live_data['homeTeam']['score']
+            away_score = live_data['awayTeam']['score']
+            
+            period = live_data.get('period', 0)
+            game_clock = live_data.get('gameClock', 'PT0M00.00S')
+            total_seconds = self._parse_time(period, game_clock)
+            
+            # Rebuild features for export
+            live_features = self._build_features(game, home_score - away_score, total_seconds, period)
+            
+            # Get distribution params
+            X_live = pd.DataFrame([{col: live_features.get(col, 0.0) for col in self.spread_model.feature_order}], 
+                                  columns=self.spread_model.feature_order)
+            
+            locs, scales, dfs = [], [], []
+            for model in self.spread_model.ensemble:
+                dist = model.pred_dist(X_live.values)
+                locs.append(dist.loc[0])
+                scales.append(dist.scale[0])
+                dfs.append(dist.df[0] if hasattr(dist, 'df') else 30.0)
+            
+            driving_features = {
+                "live": {
+                    "Pace": f"{live_features.get('live_pace', 0):.1f}",
+                    "Momentum": f"{live_features.get('score_momentum', 0):+.1f}",
+                    "Home eFG%": f"{live_features.get('home_efg', 0):.1%}",
+                    "Away eFG%": f"{live_features.get('away_efg', 0):.1%}",
+                    "TO Diff": f"{live_features.get('turnover_diff', 0):+d}",
+                },
+                "team_recent": {
+                    "Home OffRtg": f"{live_features.get('home_team_recent_off_rtg', 0):.1f}",
+                    "Home DefRtg": f"{live_features.get('home_team_recent_def_rtg', 0):.1f}",
+                    "Away OffRtg": f"{live_features.get('away_team_recent_off_rtg', 0):.1f}",
+                    "Away DefRtg": f"{live_features.get('away_team_recent_def_rtg', 0):.1f}",
+                },
+                "volatility": {
+                    "Lead Changes": live_features.get('lead_changes', 0),
+                    "Volatility": f"{live_features.get('score_volatility', 0):.2f}",
+                }
+            }
+            
+            game_state = {
+                "game_id": game_id,
+                "home_team": game['homeTeam']['teamTricode'],
+                "away_team": game['awayTeam']['teamTricode'],
+                "home_score": home_score,
+                "away_score": away_score,
+                "seconds_remaining": total_seconds,
+                "period": period,
+                "distribution": {
+                    "loc": np.mean(locs) + (home_score - away_score),
+                    "scale": np.mean(scales),
+                    "df": np.mean(dfs)
+                },
+                "driving_features": driving_features,
+                "markets": []
+            }
+            
+            for market in match['spread_markets']:
+                market_orders = [o for o in self.order_mgr.get_open_orders() if o.ticker == market.ticker]
+                curr_p = self.portfolio.positions.get(market.ticker, 0)
+                
+                # Calculate exposures
+                # Note: SimpleLiveTrader risk_mgr._calculate_order_exposure(side, price, size, current_pos)
+                pending_buy_exp = sum(self.risk_mgr._calculate_order_exposure('buy', o.price, o.size, curr_p) for o in market_orders if o.side == 'buy')
+                pending_sell_exp = sum(self.risk_mgr._calculate_order_exposure('sell', o.price, o.size, curr_p) for o in market_orders if o.side == 'sell')
+                
+                pos_exp = 0.0
+                if curr_p != 0:
+                    cost = self.portfolio.cost_basis.get(market.ticker, 50.0)
+                    pos_exp = self.risk_mgr._calculate_order_exposure('buy' if curr_p > 0 else 'sell', cost, abs(curr_p), 0)
+
+                game_state["markets"].append({
+                    "ticker": market.ticker,
+                    "spread": market.spread,
+                    "team": market.team,
+                    "bid": market.yes_bid,
+                    "ask": market.yes_ask,
+                    "fair_value": getattr(self, '_model_fair_values', {}).get(market.ticker),
+                    "position": curr_p,
+                    "pending_buy": sum(o.size for o in market_orders if o.side == 'buy'),
+                    "pending_buy_exp": pending_buy_exp,
+                    "pending_sell": sum(o.size for o in market_orders if o.side == 'sell'),
+                    "pending_sell_exp": pending_sell_exp,
+                    "position_exp": pos_exp
+                })
+            
+            state["games"].append(game_state)
+            
+        with open('data/dashboard_state.json', 'w') as f:
+            json.dump(state, f)
+    
     def _build_features(self, game, score_diff, total_seconds, period) -> dict:
         """Build feature dict for model."""
         # Update history for momentum calculation
@@ -767,7 +895,7 @@ def main():
     # API credentials
     kalshi_key_id = "a40ff1c6-12ac-4a6c-9669-ffe12f3de235"
     kalshi_key_path = "key.key"
-    bal = 200
+    bal = 300
     risk_rate = 0.05
     MAX_EXPOSURE = bal * risk_rate
     trader = SimpleLiveTrader(

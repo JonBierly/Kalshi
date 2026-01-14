@@ -66,7 +66,7 @@ if __name__ == "__main__":
     import argparse
     
     parser = argparse.ArgumentParser(description='Backfill game play-by-play data for specified seasons.')
-    parser.add_argument('--seasons', nargs='+', default=['2024-25', '2025-26'],
+    parser.add_argument('--seasons', nargs='+', default=['2025-26'],
                         help='List of seasons to backfill (e.g., --seasons 2024-25 2025-26)')
     parser.add_argument('--limit', type=int, default=None,
                         help='Limit number of games per season (for testing)')

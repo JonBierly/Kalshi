@@ -77,7 +77,7 @@ class RebalancingLiveTrader:
             max_ticker_exposure=max_ticker_exposure,
             scale_up_band=0.10,
             derisk_band=0.20,
-            min_trade_spread=8
+            min_trade_spread=6
         )
         self.weight_history = {} # {game_id: {ticker: [w1, w2, w3]}}
         self.risk_mgr = RiskManager(max_game_exposure * 10, max_game_exposure)
@@ -527,7 +527,8 @@ class RebalancingLiveTrader:
                             ci_lower=act.ci_lower * 100, ci_upper=act.ci_upper * 100,
                             market_spread=act.market_spread, seconds_remaining=act.seconds_remaining,
                             position_before=self.portfolio.positions.get(act.ticker, 0),
-                            kalshi_order_id=order_id
+                            kalshi_order_id=order_id,
+                            strategy_id='rebalancer'
                         )
                         curr_game_exp += delta
 

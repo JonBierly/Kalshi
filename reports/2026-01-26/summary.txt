@@ -1,0 +1,30 @@
+============================================================
+DAILY PERFORMANCE REPORT: 2026-01-26
+Generated: 2026-01-27 18:48:50
+============================================================
+
+📊 OVERALL STATISTICS
+----------------------------------------
+Total Orders Placed: 1107
+Total Fills: 379
+Fill Rate: 34.2%
+Total P&L: $-14.74 (net of $4.57 fees)
+Markets Traded: 75
+
+🔍 KEY FINDINGS
+----------------------------------------
+• Best edge bucket: Large (10-15¢) ($3.05)
+• Worst edge bucket: Huge (>15¢) ($-17.15)
+• Best time phase: 4th Qtr (5-12m) ($3.94)
+• Worst time phase: 1st Half (24-36m) ($-6.40)
+
+📁 FILES GENERATED
+----------------------------------------
+• time_analysis.png
+• spread_analysis.png
+• liquidity_analysis.png
+• edge_analysis.png
+• spread_line_analysis.png
+• position_breakdown.png
+• full_trades.csv
+• summary.txt

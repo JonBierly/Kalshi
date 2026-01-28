@@ -53,6 +53,10 @@ class TeamStatsEngine:
         df_merged['def_rtg'] = 100 * df_merged['opp_pts'] / df_merged['opp_poss']
         df_merged['win'] = df_merged['wl'].apply(lambda x: 1 if x == 'W' else 0)
         
+        # New defensive stats
+        df_merged['stl_rate'] = df_merged['stl'] / df_merged['possessions']
+        df_merged['blk_rate'] = df_merged['blk'] / df_merged['possessions']
+        
         features = []
         
         # Group by Team AND Season to prevent stats leaking across seasons
@@ -60,12 +64,12 @@ class TeamStatsEngine:
             team_df = team_df.sort_values('game_date')
             
             # Season-to-Date (Expanding, shifted to exclude current game)
-            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace']].expanding().mean().shift(1)
+            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate']].expanding().mean().shift(1)
             season_stats.columns = [f'team_season_{c}' for c in season_stats.columns]
             season_stats = season_stats.rename(columns={'team_season_win': 'team_season_win_pct'})
             
             # Recent (Last 10, shifted)
-            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace']].rolling(window=10, min_periods=1).mean().shift(1)
+            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate']].rolling(window=10, min_periods=1).mean().shift(1)
             recent_stats.columns = [f'team_recent_{c}' for c in recent_stats.columns]
             recent_stats = recent_stats.rename(columns={'team_recent_win': 'team_recent_win_pct'})
             
@@ -105,6 +109,10 @@ class TeamStatsEngine:
         df_merged['def_rtg'] = 100 * df_merged['opp_pts'] / df_merged['opp_poss']
         df_merged['win'] = df_merged['wl'].apply(lambda x: 1 if x == 'W' else 0)
         
+        # New defensive stats
+        df_merged['stl_rate'] = df_merged['stl'] / df_merged['possessions']
+        df_merged['blk_rate'] = df_merged['blk'] / df_merged['possessions']
+        
         latest_stats = {}
         
         # Group by Team AND Season
@@ -114,10 +122,10 @@ class TeamStatsEngine:
             if team_df.empty: continue
                 
             # Season-to-Date (Expanding, NO SHIFT)
-            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace']].expanding().mean().iloc[-1]
+            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate']].expanding().mean().iloc[-1]
             
             # Recent (Last 10, NO SHIFT)
-            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace']].rolling(window=10, min_periods=1).mean().iloc[-1]
+            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate']].rolling(window=10, min_periods=1).mean().iloc[-1]
             
             # Rest Days relative to now logic stays in get_latest_features
             last_game_date = team_df['game_date'].iloc[-1]
@@ -128,12 +136,16 @@ class TeamStatsEngine:
             stats['team_season_def_rtg'] = season_stats['def_rtg']
             stats['team_season_win_pct'] = season_stats['win']
             stats['team_season_pace'] = season_stats['pace']
+            stats['team_season_stl_rate'] = season_stats['stl_rate']
+            stats['team_season_blk_rate'] = season_stats['blk_rate']
             
             # Recent
             stats['team_recent_off_rtg'] = recent_stats['off_rtg']
             stats['team_recent_def_rtg'] = recent_stats['def_rtg']
             stats['team_recent_win_pct'] = recent_stats['win']
             stats['team_recent_pace'] = recent_stats['pace']
+            stats['team_recent_stl_rate'] = recent_stats['stl_rate']
+            stats['team_recent_blk_rate'] = recent_stats['blk_rate']
             
             stats['last_game_date'] = last_game_date
             
@@ -215,6 +227,13 @@ class RosterEngine:
         # Recent Stats
         recent_cols = [c for c in team_p.columns if 'player_recent_' in c and 'min_float' not in c]
         recent_weights = team_p['player_recent_min_float'].fillna(0)
+        
+        # Add unweighted averages for PIE to catch rotation shifts
+        if 'player_recent_pie' in team_p.columns:
+            item['roster_recent_pie_unweighted'] = team_p['player_recent_pie'].mean()
+        if 'player_season_pie' in team_p.columns:
+            item['roster_season_pie_unweighted'] = team_p['player_season_pie'].mean()
+
         if recent_weights.sum() > 0:
             for col in recent_cols:
                 metric_name = col.replace('player_', 'roster_')
@@ -255,7 +274,7 @@ class RosterEngine:
         
         # Metrics to track
         # Switched to estimated ratings and removed net_rating
-        metrics = ['est_off_rating', 'est_def_rating', 'pie', 'est_usg_pct']
+        metrics = ['est_off_rating', 'est_def_rating', 'pie', 'est_usg_pct', 'ts_pct', 'ast_pct']
         
         features = []
         
@@ -290,7 +309,7 @@ class RosterEngine:
         df['game_date'] = pd.to_datetime(df['game_date'])
         df['min_float'] = df['minutes'].apply(self._parse_minutes)
         
-        metrics = ['est_off_rating', 'est_def_rating', 'pie', 'est_usg_pct']
+        metrics = ['est_off_rating', 'est_def_rating', 'pie', 'est_usg_pct', 'ts_pct', 'ast_pct']
         cols_to_roll = metrics + ['min_float']
         
         latest_stats_dict = {}
@@ -395,6 +414,12 @@ class RosterEngine:
         recent_cols = [c for c in active_players.columns if 'player_recent_' in c and 'min_float' not in c]
         recent_weights = active_players['player_recent_min_float'].fillna(0)
         
+        # Add unweighted averages for PIE
+        if 'player_recent_pie' in active_players.columns:
+            feat_dict['roster_recent_pie_unweighted'] = active_players['player_recent_pie'].mean()
+        if 'player_season_pie' in active_players.columns:
+            feat_dict['roster_season_pie_unweighted'] = active_players['player_season_pie'].mean()
+
         if recent_weights.sum() > 0:
             for col in recent_cols:
                 metric_name = col.replace('player_', 'roster_')
@@ -423,8 +448,8 @@ class FeatureEngine:
         self.reset()
 
     def reset(self):
-        self.home_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0, 'pts': 0, 'fta': 0, 'oreb': 0}
-        self.away_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0, 'pts': 0, 'fta': 0, 'oreb': 0}
+        self.home_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0, 'pts': 0, 'fta': 0, 'oreb': 0, 'stl': 0, 'blk': 0}
+        self.away_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0, 'pts': 0, 'fta': 0, 'oreb': 0, 'stl': 0, 'blk': 0}
         self.history = [] # List of (seconds_remaining, score_diff)
         self.current_features = {}
         self.lead_changes = 0
@@ -455,10 +480,18 @@ class FeatureEngine:
             if 'offensive' in description: stats['oreb'] += 1
         elif event_type == 5 or 'turnover' in event_type_str: # Turnover
             stats['to'] += 1
+            if 'steal' in description:
+                # The OTHER team got the steal
+                other_stats = self.away_stats if is_home else self.home_stats
+                other_stats['stl'] += 1
         elif 'free throw' in event_type_str:
             stats['fta'] += 1
             if 'miss' not in description:
                 stats['pts'] += 1
+        elif 'block' in description:
+            # The OTHER team got the block
+            other_stats = self.away_stats if is_home else self.home_stats
+            other_stats['blk'] += 1
             
         # Time remaining logic
         seconds_remaining = event_row['remaining_time']
@@ -483,15 +516,37 @@ class FeatureEngine:
 
     def calculate_current_features(self, score_diff, seconds_remaining, period, game_id, home_id, away_id):
         """Calculates features from current internal state."""
-        # Momentum: Change in score diff over last 5 minutes (300 seconds)
-        momentum = 0
+        # Multi-window Momentum: Change in score diff over various windows
+        windows = {
+            'momentum_2min': 120,
+            'momentum_4min': 240,
+            'momentum_6min': 360,
+            'momentum_8min': 480,
+            'momentum_10min': 600
+        }
+        
+        momentum_features = {}
         if self.history:
-            start_score = self.history[0][1]
+            for feat_name, window_secs in windows.items():
+                start_score = self.history[0][1]
+                for h_time, h_score in reversed(self.history):
+                    if h_time > seconds_remaining + window_secs:
+                        start_score = h_score
+                        break
+                momentum_features[feat_name] = score_diff - start_score
+        else:
+            momentum_features = {feat_name: 0 for feat_name in windows}
+        
+        # Original 5-min momentum for backward compatibility (if needed)
+        # But we'll mostly use the new ones
+        momentum_5min = momentum_features.get('momentum_6min', 0) # approximation or keep as is
+        start_score_5min = self.history[0][1] if self.history else 0
+        if self.history:
             for h_time, h_score in reversed(self.history):
                 if h_time > seconds_remaining + 300:
-                    start_score = h_score
+                    start_score_5min = h_score
                     break
-            momentum = score_diff - start_score
+        momentum_5min = score_diff - start_score_5min
             
         # Lead Changes: Count lead swaps since game start
         current_leader = 1 if score_diff > 0 else (-1 if score_diff < 0 else 0)
@@ -519,6 +574,13 @@ class FeatureEngine:
         home_3p_reliance = (self.home_stats['fg3m'] * 3) / max(self.home_stats['pts'], 1)
         away_3p_reliance = (self.away_stats['fg3m'] * 3) / max(self.away_stats['pts'], 1)
 
+        # Live Defensive Rates (per minute elapsed)
+        elapsed_mins = max((2880 - seconds_remaining) / 60, 1)
+        home_steal_rate = self.home_stats['stl'] / elapsed_mins
+        away_steal_rate = self.away_stats['stl'] / elapsed_mins
+        home_block_rate = self.home_stats['blk'] / elapsed_mins
+        away_block_rate = self.away_stats['blk'] / elapsed_mins
+
         self.current_features = {
             'score_diff': score_diff,
             'seconds_remaining': seconds_remaining,
@@ -536,9 +598,14 @@ class FeatureEngine:
             'home_rebound_rate': self._calc_reb_rate(self.home_stats['reb'], self.away_stats['reb']),
             'required_catchup_rate': abs(score_diff) / (seconds_remaining + 1),
             'live_pace': live_pace,
-            'score_momentum': momentum,
+            'score_momentum': momentum_5min,
+            **momentum_features,
             'home_3p_reliance': home_3p_reliance,
             'away_3p_reliance': away_3p_reliance,
+            'home_steal_rate': home_steal_rate,
+            'away_steal_rate': away_steal_rate,
+            'home_block_rate': home_block_rate,
+            'away_block_rate': away_block_rate,
             'game_id': game_id,
             'home_team_id': home_id,
             'away_team_id': away_id
@@ -617,7 +684,9 @@ def add_advanced_features(pbp_df: pd.DataFrame) -> pd.DataFrame:
 ADVANCED_FEATURES_LIST = [
     # Team recent performance (last 10 games)
     'home_team_recent_off_rtg', 'home_team_recent_def_rtg', 'home_team_recent_win_pct', 'home_team_recent_pace',
+    'home_team_recent_stl_rate', 'home_team_recent_blk_rate',
     'away_team_recent_off_rtg', 'away_team_recent_def_rtg', 'away_team_recent_win_pct', 'away_team_recent_pace',
+    'away_team_recent_stl_rate', 'away_team_recent_blk_rate',
     
     # Rest and home court
     'home_rest_days', 'home_is_home',
@@ -625,13 +694,11 @@ ADVANCED_FEATURES_LIST = [
     
     # Roster recent performance (last 10 games)
     'home_roster_recent_est_off_rating', 'home_roster_recent_est_def_rating', 
-    'home_roster_recent_pie', 'home_roster_recent_est_usg_pct',
+    'home_roster_recent_pie', 'home_roster_recent_pie_unweighted', 'home_roster_recent_est_usg_pct',
+    'home_roster_recent_ts_pct', 'home_roster_recent_ast_pct',
     'away_roster_recent_est_off_rating', 'away_roster_recent_est_def_rating', 
-    'away_roster_recent_pie', 'away_roster_recent_est_usg_pct'
-]
-
-PERIOD_FEATURES_LIST = [
-    'period_1', 'period_2', 'period_3', 'period_4', 'period_5'
+    'away_roster_recent_pie', 'away_roster_recent_pie_unweighted', 'away_roster_recent_est_usg_pct',
+    'away_roster_recent_ts_pct', 'away_roster_recent_ast_pct'
 ]
 
 VOLATILITY_FEATURES_LIST = [
@@ -642,14 +709,18 @@ VOLATILITY_FEATURES_LIST = [
 # These help NGBoost learn that variance depends on BOTH time and margin
 INTERACTION_FEATURES_LIST = [
     'time_x_margin', 'time_x_abs_margin', 'margin_squared',
-    'log_time', 'time_proportion', 'close_game', 'blowout'
+    'log_time', 'time_proportion', 'close_game', 'blowout',
+    'volatility_x_time'
 ]
 
 BASE_FEATURES_LIST = [
     'score_diff', 'seconds_remaining', 'period', 'home_efg', 'away_efg', 
     'turnover_diff', 'home_rebound_rate', 'required_catchup_rate',
-    'live_pace', 'score_momentum', 'home_3p_reliance', 'away_3p_reliance'
-] + PERIOD_FEATURES_LIST + VOLATILITY_FEATURES_LIST
+    'live_pace', 'score_momentum',
+    'momentum_2min', 'momentum_4min', 'momentum_6min', 'momentum_8min', 'momentum_10min',
+    'home_3p_reliance', 'away_3p_reliance',
+    'home_steal_rate', 'away_steal_rate', 'home_block_rate', 'away_block_rate'
+] + VOLATILITY_FEATURES_LIST
 
 
 def add_interaction_features(df_or_dict):
@@ -677,6 +748,7 @@ def add_interaction_features(df_or_dict):
         result['time_proportion'] = seconds / 2880.0
         result['close_game'] = 1.0 if abs(score_diff) <= 10 else 0.0
         result['blowout'] = 1.0 if abs(score_diff) >= 20 else 0.0
+        result['volatility_x_time'] = result.get('score_volatility', 0.0) * seconds
         
         return result
     else:
@@ -690,5 +762,6 @@ def add_interaction_features(df_or_dict):
         df['time_proportion'] = df['seconds_remaining'] / 2880.0
         df['close_game'] = (np.abs(df['score_diff']) <= 10).astype(float)
         df['blowout'] = (np.abs(df['score_diff']) >= 20).astype(float)
+        df['volatility_x_time'] = df['score_volatility'] * df['seconds_remaining']
         
         return df

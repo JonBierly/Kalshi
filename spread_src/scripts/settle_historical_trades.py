@@ -30,20 +30,47 @@ KEY_PATH = "key.key"
 def get_settlements_pnl(kalshi):
     """
     Fetch all settlements and calculate correct P&L per ticker.
-    
-    Uses the correct formula:
-        payout = winning_side_count × 100 cents
-        pnl = (payout - yes_cost - no_cost) / 100 - fees
+    Iterates backwards in time to cover all historical trades.
     """
-    # Get all settlements (no date filter)
-    settlements = kalshi.get_settlements(limit=1000)
+    all_settlements = []
     
+    # We need to cover from Dec 12, 2025 to now
+    start_date = datetime(2025, 12, 11) # A bit before the first trade
+    end_date = datetime.now()
+    
+    current_end = end_date
+    while current_end > start_date:
+        current_start = current_end - timedelta(days=7)
+        print(f"  📥 Fetching settlements from {current_start.date()} to {current_end.date()}...")
+        
+        min_ts = int(current_start.timestamp() * 1000)
+        max_ts = int(current_end.timestamp() * 1000)
+        
+        chunk = kalshi.get_settlements(min_ts=min_ts, max_ts=max_ts, limit=1000)
+        if not chunk:
+            # If no settlements in this week, just keep going back
+            pass
+        else:
+            all_settlements.extend(chunk)
+            
+        current_end = current_start
+        # Safety break - the API only returns settled things, 
+        # but don't go back forever
+        if current_end < datetime(2025, 11, 1):
+            break
+
     ticker_pnl = {}
+    seen_tickers = set()
     
-    for s in settlements:
+    for s in all_settlements:
         ticker = s.get('ticker', '')
         if 'KXNBASPREAD' not in ticker:
             continue
+        
+        # Avoid duplicate tickers from overlapping windows
+        if ticker in seen_tickers:
+            continue
+        seen_tickers.add(ticker)
         
         yes_count = s.get('yes_count', 0)
         no_count = s.get('no_count', 0)
@@ -137,38 +164,58 @@ def settle_historical_trades(force=False):
             'status': status
         })
     
+    # Get trade outcomes and calculate P&L per trade
     settled_count = 0
     total_pnl = 0.0
     
+    from spread_src.utils.kalshi_fees import calculate_kalshi_fee
+
     for ticker, trade_list in trades_by_ticker.items():
         if ticker not in ticker_pnl:
             # Market hasn't settled yet
             print(f"  ⏳ {ticker[-15:]}: Not settled yet ({len(trade_list)} trades)")
             continue
         
-        # Get P&L for this ticker
+        # Get outcome for this ticker
         pnl_info = ticker_pnl[ticker]
-        ticker_total_pnl = pnl_info['pnl']
-        
-        # Distribute P&L proportionally to trades by size
-        total_size = sum(t['size'] for t in trade_list)
+        market_result = pnl_info['market_result'] # 'yes' or 'no'
+        is_yes_win = (market_result.lower() == 'yes')
         
         for trade in trade_list:
-            # P&L proportional to trade size
-            trade_pnl = ticker_total_pnl * (trade['size'] / total_size)
+            trade_id = trade['trade_id']
+            side = trade['side'].lower()
+            fill_price = trade['fill_price']
+            size = trade['size']
+            
+            # OutcomeValue of the YES contract (100 if it wins, 0 otherwise)
+            outcome_value = 100 if is_yes_win else 0
+            
+            # 1. Calculate Gross P&L
+            if side == 'buy':
+                # Long YES: P&L = (FinalValue - PurchasePrice) * Size
+                gross_pnl_cents = (outcome_value - fill_price) * size
+            else:
+                # Sell YES (Short): P&L = (SalePrice - FinalValue) * Size
+                gross_pnl_cents = (fill_price - outcome_value) * size
+                
+            # 2. Calculate Fee
+            fee = calculate_kalshi_fee(fill_price, size)
+            
+            # 3. Final Realized P&L in Dollars
+            real_pnl = (gross_pnl_cents / 100.0) - fee
             
             # Update database
-            logger.log_position_closed(trade['trade_id'], trade_pnl)
+            logger.log_position_closed(trade_id, real_pnl)
             
             settled_count += 1
-            total_pnl += trade_pnl
+            total_pnl += real_pnl
         
-        result_emoji = "✅" if ticker_total_pnl >= 0 else "❌"
-        print(f"  {result_emoji} {ticker[-15:]}: {len(trade_list)} trades → ${ticker_total_pnl:+.2f} ({pnl_info['market_result'].upper()})")
+        ticker_win = (pnl_info['pnl'] >= 0) # Aggregate ticker was profitable
+        result_emoji = "✅" if ticker_win else "❌"
+        print(f"  {result_emoji} {ticker[-15:]}: Settled {len(trade_list)} trades | Result: {market_result.upper()}")
     
     print("-" * 60)
     print(f"\n📊 SUMMARY")
-    print(f"  Tickers settled: {len([t for t in trades_by_ticker if t in ticker_pnl])}")
     print(f"  Trades updated: {settled_count}")
     print(f"  Total P&L: ${total_pnl:+.2f}")
     

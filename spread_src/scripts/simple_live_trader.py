@@ -633,7 +633,8 @@ class SimpleLiveTrader:
                         ci_upper=opp.ci_upper * 100 if opp.ci_upper else None,
                         market_spread=opp.market_spread,
                         seconds_remaining=getattr(opp, 'seconds_remaining', None),
-                        kalshi_order_id=order_id
+                        kalshi_order_id=order_id,
+                        strategy_id='simple_ev'
                     )
                     
                     # Update exposure tracking for next iteration

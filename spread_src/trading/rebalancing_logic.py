@@ -253,7 +253,7 @@ class MultiAssetRebalancer:
         max_ticker_exposure: float = 5.0,
         scale_up_band: float = 0.10,  # 10% band for buying
         derisk_band: float = 0.20,    # 20% band for selling (asymmetric)
-        min_trade_spread: int = 8     # Don't entry/scale-up if spread < 8c
+        min_trade_spread: int = 6     # Don't entry/scale-up if spread < 6c
     ):
         self.bankroll = bankroll
         self.kelly_fraction = kelly_fraction

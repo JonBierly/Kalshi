@@ -64,15 +64,21 @@ class TradeLogger:
                 kalshi_order_id TEXT,
                 
                 -- Metadata
+                strategy_id TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 filled_at DATETIME,
                 closed_at DATETIME
             )
         ''')
         
+        # Migration: Add strategy_id column if it doesn't exist
+        try:
+            cursor.execute('ALTER TABLE trades ADD COLUMN strategy_id TEXT')
+        except sqlite3.OperationalError:
+            # Column already exists
+            pass
+        
         # Table 2: Model Predictions
-        # Drop and recreate to ensure clean schema transition as requested
-        cursor.execute('DROP TABLE IF EXISTS model_predictions')
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS model_predictions (
                 prediction_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -160,7 +166,8 @@ class TradeLogger:
         market_spread: Optional[float] = None,
         seconds_remaining: Optional[int] = None,
         position_before: int = 0,
-        kalshi_order_id: Optional[str] = None
+        kalshi_order_id: Optional[str] = None,
+        strategy_id: Optional[str] = None
     ) -> int:
         """
         Log order placement.
@@ -179,10 +186,10 @@ class TradeLogger:
                 ticker, game_id, side, order_price, size,
                 model_fair_value, model_ci_lower, model_ci_upper,
                 market_spread, seconds_remaining, position_before,
-                status, kalshi_order_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed', ?)
+                status, kalshi_order_id, strategy_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'placed', ?, ?)
         ''', (ticker, game_id, side, price, size, model_fair, ci_lower, ci_upper,
-              market_spread, seconds_remaining, position_before, kalshi_order_id))
+              market_spread, seconds_remaining, position_before, kalshi_order_id, strategy_id))
         
         trade_id = cursor.lastrowid
         conn.commit()

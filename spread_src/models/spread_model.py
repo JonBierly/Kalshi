@@ -18,6 +18,7 @@ import joblib
 
 from spread_src.features.engineering import add_interaction_features
 from spread_src.models.distributions import SafeT  # Required for pickle loading
+from ngboost.distns import Laplace # Required for pickle loading
 
 
 class SpreadDistributionModel:
@@ -91,15 +92,19 @@ class SpreadDistributionModel:
             dist = model.pred_dist(X_live.values)
             predicted_remainder = dist.loc[0]
             
-            # For StudentT, true std = scale * sqrt(df / (df - 2))
+            # Distribution-specific standard deviation
             scale = dist.scale[0]
-            df = dist.df[0] if hasattr(dist, 'df') else 30.0 # Default to large df if Normal
             
-            # Calculate real standard deviation for display/tracking
-            if df > 2:
-                true_std = scale * np.sqrt(df / (df - 2))
+            if self.distribution_type == 'Laplace' or isinstance(dist, Laplace):
+                # Variance of Laplace is 2 * b^2
+                true_std = scale * np.sqrt(2)
             else:
-                true_std = scale * 10.0 # Cap if df <= 2
+                # Fallback to Student-T or Normal
+                df = dist.df[0] if hasattr(dist, 'df') else 30.0
+                if df > 2:
+                    true_std = scale * np.sqrt(df / (df - 2))
+                else:
+                    true_std = scale * 10.0
             
             # Reconstruct final diff
             reconstructed_mean = current_diff + predicted_remainder
@@ -139,12 +144,15 @@ class SpreadDistributionModel:
             # Reconstruct mean and calculate true std
             predicted_remainder = dist.loc[0]
             scale = dist.scale[0]
-            df = dist.df[0] if hasattr(dist, 'df') else 30.0
             
-            if df > 2:
-                true_std = scale * np.sqrt(df / (df - 2))
+            if self.distribution_type == 'Laplace' or isinstance(dist, Laplace):
+                true_std = scale * np.sqrt(2)
             else:
-                true_std = scale * 10.0
+                df = dist.df[0] if hasattr(dist, 'df') else 30.0
+                if df > 2:
+                    true_std = scale * np.sqrt(df / (df - 2))
+                else:
+                    true_std = scale * 10.0
             
             all_remainders.append(predicted_remainder)
             all_stds.append(true_std)

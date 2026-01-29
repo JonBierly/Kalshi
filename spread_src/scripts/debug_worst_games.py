@@ -21,6 +21,9 @@ def analyze_worst_games():
     df = pd.read_sql_query(query, conn)
     conn.close()
 
+    # Filter out trades with an edge of < 2
+    df = df[abs(df['model_fair_value'] - df['fill_price']) >= 2]
+
     # Filter for worst games
     # Tickers look like: KXNBASPREAD-26JAN03MINMIA-MIN5.5
     def matches_target(ticker):

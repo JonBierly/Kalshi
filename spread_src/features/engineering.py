@@ -52,10 +52,46 @@ class TeamStatsEngine:
         
         df_merged['def_rtg'] = 100 * df_merged['opp_pts'] / df_merged['opp_poss']
         df_merged['win'] = df_merged['wl'].apply(lambda x: 1 if x == 'W' else 0)
+        df_merged['win_margin'] = df_merged['pts'] - df_merged['opp_pts']
+        
+        # Quarter scoring consistency proxy
+        df_merged['pts_var'] = df_merged['pts']
         
         # New defensive stats
         df_merged['stl_rate'] = df_merged['stl'] / df_merged['possessions']
         df_merged['blk_rate'] = df_merged['blk'] / df_merged['possessions']
+        
+        # New defensive stats
+        df_merged['stl_rate'] = df_merged['stl'] / df_merged['possessions']
+        df_merged['blk_rate'] = df_merged['blk'] / df_merged['possessions']
+        
+        # Calculate SOS (Strength of Schedule)
+        # We need the opponent's win percentage entering the game.
+        # This is a bit of a circular dependency in rolling, so we'll do an approximating merge.
+        # First, we need a lookup for (team, game_id) -> win_pct
+        df_merged['game_date'] = pd.to_datetime(df_merged['game_date'])
+        
+        # We'll compute the win_pct separately and then merge back for SOS
+        win_pct_lookup = []
+        for (team_id, season), team_df in df_merged.groupby(['team_id', 'season']):
+            team_df = team_df.sort_values('game_date')
+            wp = team_df['win'].expanding().mean().shift(1).fillna(0.5)
+            lookup = pd.DataFrame({
+                'game_id': team_df['game_id'],
+                'team_id': team_id,
+                'prior_win_pct': wp
+            })
+            win_pct_lookup.append(lookup)
+        
+        wp_df = pd.concat(win_pct_lookup)
+        
+        # Merge opponent's prior win pct back into df_merged
+        df_merged = pd.merge(
+            df_merged, 
+            wp_df.rename(columns={'team_id': 'opp_id', 'prior_win_pct': 'opp_prior_win_pct'}),
+            on=['game_id', 'opp_id'],
+            how='left'
+        )
         
         features = []
         
@@ -64,14 +100,19 @@ class TeamStatsEngine:
             team_df = team_df.sort_values('game_date')
             
             # Season-to-Date (Expanding, shifted to exclude current game)
-            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate']].expanding().mean().shift(1)
+            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate', 'win_margin']].expanding().mean().shift(1)
             season_stats.columns = [f'team_season_{c}' for c in season_stats.columns]
             season_stats = season_stats.rename(columns={'team_season_win': 'team_season_win_pct'})
             
             # Recent (Last 10, shifted)
-            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate']].rolling(window=10, min_periods=1).mean().shift(1)
+            # Add SOS and consistency (pts variance) to recent stats
+            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate', 'win_margin', 'opp_prior_win_pct', 'pts_var']].rolling(window=10, min_periods=1).mean().shift(1)
+            # For consistency, we want the rolling STDEV of points
+            pts_consistency = team_df['pts'].rolling(window=10, min_periods=1).std().shift(1)
+            
             recent_stats.columns = [f'team_recent_{c}' for c in recent_stats.columns]
-            recent_stats = recent_stats.rename(columns={'team_recent_win': 'team_recent_win_pct'})
+            recent_stats = recent_stats.rename(columns={'team_recent_win': 'team_recent_win_pct', 'team_recent_opp_prior_win_pct': 'team_recent_SOS'})
+            recent_stats['team_recent_scoring_consistency'] = pts_consistency
             
             # Combine
             team_feats = pd.concat([team_df[['game_id', 'team_id', 'game_date', 'side']], season_stats, recent_stats], axis=1)
@@ -108,10 +149,31 @@ class TeamStatsEngine:
         
         df_merged['def_rtg'] = 100 * df_merged['opp_pts'] / df_merged['opp_poss']
         df_merged['win'] = df_merged['wl'].apply(lambda x: 1 if x == 'W' else 0)
+        df_merged['win_margin'] = df_merged['pts'] - df_merged['opp_pts']
         
         # New defensive stats
         df_merged['stl_rate'] = df_merged['stl'] / df_merged['possessions']
         df_merged['blk_rate'] = df_merged['blk'] / df_merged['possessions']
+        
+        # Calculate SOS for latest stats
+        df_merged['game_date'] = pd.to_datetime(df_merged['game_date'])
+        win_pct_lookup = []
+        for (team_id, season), team_df in df_merged.groupby(['team_id', 'season']):
+            team_df = team_df.sort_values('game_date')
+            wp = team_df['win'].expanding().mean().fillna(0.5)
+            lookup = pd.DataFrame({
+                'game_id': team_df['game_id'],
+                'team_id': team_id,
+                'prior_win_pct': wp
+            })
+            win_pct_lookup.append(lookup)
+        wp_df = pd.concat(win_pct_lookup)
+        df_merged = pd.merge(
+            df_merged, 
+            wp_df.rename(columns={'team_id': 'opp_id', 'prior_win_pct': 'opp_prior_win_pct'}),
+            on=['game_id', 'opp_id'],
+            how='left'
+        )
         
         latest_stats = {}
         
@@ -122,10 +184,10 @@ class TeamStatsEngine:
             if team_df.empty: continue
                 
             # Season-to-Date (Expanding, NO SHIFT)
-            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate']].expanding().mean().iloc[-1]
+            season_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate', 'win_margin']].expanding().mean().iloc[-1]
             
             # Recent (Last 10, NO SHIFT)
-            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate']].rolling(window=10, min_periods=1).mean().iloc[-1]
+            recent_stats = team_df[['off_rtg', 'def_rtg', 'win', 'pace', 'stl_rate', 'blk_rate', 'win_margin', 'opp_prior_win_pct']].rolling(window=10, min_periods=1).mean().iloc[-1]
             
             # Rest Days relative to now logic stays in get_latest_features
             last_game_date = team_df['game_date'].iloc[-1]
@@ -138,6 +200,7 @@ class TeamStatsEngine:
             stats['team_season_pace'] = season_stats['pace']
             stats['team_season_stl_rate'] = season_stats['stl_rate']
             stats['team_season_blk_rate'] = season_stats['blk_rate']
+            stats['team_season_win_margin'] = season_stats['win_margin']
             
             # Recent
             stats['team_recent_off_rtg'] = recent_stats['off_rtg']
@@ -146,6 +209,9 @@ class TeamStatsEngine:
             stats['team_recent_pace'] = recent_stats['pace']
             stats['team_recent_stl_rate'] = recent_stats['stl_rate']
             stats['team_recent_blk_rate'] = recent_stats['blk_rate']
+            stats['team_recent_win_margin'] = recent_stats['win_margin']
+            stats['team_recent_SOS'] = recent_stats['opp_prior_win_pct']
+            stats['team_recent_scoring_consistency'] = team_df['pts'].rolling(window=10, min_periods=1).std().iloc[-1]
             
             stats['last_game_date'] = last_game_date
             
@@ -451,6 +517,7 @@ class FeatureEngine:
         self.home_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0, 'pts': 0, 'fta': 0, 'oreb': 0, 'stl': 0, 'blk': 0}
         self.away_stats = {'fgm': 0, 'fga': 0, 'fg3m': 0, 'to': 0, 'reb': 0, 'pts': 0, 'fta': 0, 'oreb': 0, 'stl': 0, 'blk': 0}
         self.history = [] # List of (seconds_remaining, score_diff)
+        self.points_per_q = {1: [], 2: [], 3: [], 4: []} # Historical pts for consistency
         self.current_features = {}
         self.lead_changes = 0
         self.last_leader = 0 # 1 for home, -1 for away, 0 for tie
@@ -585,11 +652,6 @@ class FeatureEngine:
             'score_diff': score_diff,
             'seconds_remaining': seconds_remaining,
             'period': period,
-            'period_1': 1 if period == 1 else 0,
-            'period_2': 1 if period == 2 else 0,
-            'period_3': 1 if period == 3 else 0,
-            'period_4': 1 if period == 4 else 0,
-            'period_5': 1 if period >= 5 else 0,
             'lead_changes': self.lead_changes,
             'score_volatility': score_volatility,
             'home_efg': self._calc_efg(self.home_stats),
@@ -682,23 +744,22 @@ def add_advanced_features(pbp_df: pd.DataFrame) -> pd.DataFrame:
 
 # Advanced features - using only recent stats (removed season stats due to high correlation)
 ADVANCED_FEATURES_LIST = [
-    # Team recent performance (last 10 games)
+    # Team performance
+    'home_team_season_win_pct', 'home_team_season_off_rtg', 'home_team_season_def_rtg',
     'home_team_recent_off_rtg', 'home_team_recent_def_rtg', 'home_team_recent_win_pct', 'home_team_recent_pace',
-    'home_team_recent_stl_rate', 'home_team_recent_blk_rate',
+    'home_team_recent_SOS', 'home_team_recent_scoring_consistency',
+    'away_team_season_win_pct', 'away_team_season_off_rtg', 'away_team_season_def_rtg',
     'away_team_recent_off_rtg', 'away_team_recent_def_rtg', 'away_team_recent_win_pct', 'away_team_recent_pace',
-    'away_team_recent_stl_rate', 'away_team_recent_blk_rate',
+    'away_team_recent_SOS', 'away_team_recent_scoring_consistency',
     
-    # Rest and home court
-    'home_rest_days', 'home_is_home',
-    'away_rest_days', 'away_is_home',
+    # Rest 
+    'home_rest_days', 'away_rest_days',
     
     # Roster recent performance (last 10 games)
     'home_roster_recent_est_off_rating', 'home_roster_recent_est_def_rating', 
-    'home_roster_recent_pie', 'home_roster_recent_pie_unweighted', 'home_roster_recent_est_usg_pct',
-    'home_roster_recent_ts_pct', 'home_roster_recent_ast_pct',
+    'home_roster_recent_est_usg_pct',
     'away_roster_recent_est_off_rating', 'away_roster_recent_est_def_rating', 
-    'away_roster_recent_pie', 'away_roster_recent_pie_unweighted', 'away_roster_recent_est_usg_pct',
-    'away_roster_recent_ts_pct', 'away_roster_recent_ast_pct'
+    'away_roster_recent_est_usg_pct'
 ]
 
 VOLATILITY_FEATURES_LIST = [
@@ -709,8 +770,11 @@ VOLATILITY_FEATURES_LIST = [
 # These help NGBoost learn that variance depends on BOTH time and margin
 INTERACTION_FEATURES_LIST = [
     'time_x_margin', 'time_x_abs_margin', 'margin_squared',
-    'log_time', 'time_proportion', 'close_game', 'blowout',
-    'volatility_x_time'
+    'log_time', 'time_proportion',
+    'volatility_x_time',
+    'home_season_margin_x_time', 'away_season_margin_x_time',
+    'home_recent_margin_x_time', 'away_recent_margin_x_time',
+    'home_pie_x_time', 'away_pie_x_time'
 ]
 
 BASE_FEATURES_LIST = [
@@ -746,22 +810,40 @@ def add_interaction_features(df_or_dict):
         result['margin_squared'] = score_diff ** 2
         result['log_time'] = np.log1p(seconds)
         result['time_proportion'] = seconds / 2880.0
-        result['close_game'] = 1.0 if abs(score_diff) <= 10 else 0.0
-        result['blowout'] = 1.0 if abs(score_diff) >= 20 else 0.0
         result['volatility_x_time'] = result.get('score_volatility', 0.0) * seconds
+        
+        # PRIOR INTERACTIONS: Allow pre-game stats to decay as time runs out
+        result['home_season_margin_x_time'] = result.get('home_team_season_win_margin', 0.0) * result['time_proportion']
+        result['away_season_margin_x_time'] = result.get('away_team_season_win_margin', 0.0) * result['time_proportion']
+        result['home_recent_margin_x_time'] = result.get('home_team_recent_win_margin', 0.0) * result['time_proportion']
+        result['away_recent_margin_x_time'] = result.get('away_team_recent_win_margin', 0.0) * result['time_proportion']
+        result['home_pie_x_time'] = result.get('home_roster_recent_pie', 0.1) * result['time_proportion']
+        result['away_pie_x_time'] = result.get('away_roster_recent_pie', 0.1) * result['time_proportion']
         
         return result
     else:
         # DataFrame case (training)
         df = df_or_dict.copy()
         
-        df['time_x_margin'] = df['seconds_remaining'] * df['score_diff']
-        df['time_x_abs_margin'] = df['seconds_remaining'] * np.abs(df['score_diff'])
-        df['margin_squared'] = df['score_diff'] ** 2
-        df['log_time'] = np.log1p(df['seconds_remaining'])
-        df['time_proportion'] = df['seconds_remaining'] / 2880.0
-        df['close_game'] = (np.abs(df['score_diff']) <= 10).astype(float)
-        df['blowout'] = (np.abs(df['score_diff']) >= 20).astype(float)
-        df['volatility_x_time'] = df['score_volatility'] * df['seconds_remaining']
+        # Ensure base columns exist for math (using .get() or fillna)
+        score_diff = df['score_diff']
+        seconds = df['seconds_remaining']
+        
+        df['time_x_margin'] = seconds * score_diff
+        df['time_x_abs_margin'] = seconds * np.abs(score_diff)
+        df['margin_squared'] = score_diff ** 2
+        df['log_time'] = np.log1p(seconds)
+        df['time_proportion'] = seconds / 2880.0
+        
+        volatility = df['score_volatility'] if 'score_volatility' in df.columns else 0.0
+        df['volatility_x_time'] = volatility * seconds
+        
+        # PRIOR INTERACTIONS: Allow pre-game stats to decay as time runs out
+        df['home_season_margin_x_time'] = df.get('home_team_season_win_margin', 0.0) * df['time_proportion']
+        df['away_season_margin_x_time'] = df.get('away_team_season_win_margin', 0.0) * df['time_proportion']
+        df['home_recent_margin_x_time'] = df.get('home_team_recent_win_margin', 0.0) * df['time_proportion']
+        df['away_recent_margin_x_time'] = df.get('away_team_recent_win_margin', 0.0) * df['time_proportion']
+        df['home_pie_x_time'] = df.get('home_roster_recent_pie', 0.1) * df['time_proportion']
+        df['away_pie_x_time'] = df.get('away_roster_recent_pie', 0.1) * df['time_proportion']
         
         return df

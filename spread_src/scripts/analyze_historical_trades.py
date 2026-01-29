@@ -42,6 +42,9 @@ def analyze_historical_trades():
     """
     trades_df = pd.read_sql_query(query, conn)
     
+    # Filter out trades with an edge of < 2
+    trades_df = trades_df[abs(trades_df['model_fair_value'] - trades_df['fill_price']) >= 2]
+    
     # 3. Load games results for score diff
     games_query = "SELECT game_id, home_score, away_score FROM games WHERE home_score IS NOT NULL"
     games_df = pd.read_sql_query(games_query, conn)

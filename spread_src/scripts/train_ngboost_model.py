@@ -23,22 +23,13 @@ import matplotlib.pyplot as plt
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../..')))
 
 from ngboost import NGBRegressor
-from ngboost.scores import LogScore  # CRPScore not supported for Student-T
+from ngboost.scores import CRPScore, LogScore
+from ngboost.distns import Laplace, Normal
 from spread_src.models.distributions import SafeT
 
-# Distribution priority: SafeT > Laplace > Normal
-try:
-    DISTRIBUTION = SafeT
-    print("Using SafeT distribution (Student-T with clipped scale/df)")
-except ImportError:
-    try:
-        from ngboost.distns import Laplace
-        DISTRIBUTION = Laplace
-        print("Using Laplace distribution (fat tails, fallback)")
-    except ImportError:
-        from ngboost.distns import Normal
-        DISTRIBUTION = Normal
-        print("WARNING: Using Normal distribution (thin tails)")
+# Default Settings
+DISTRIBUTION = Laplace
+SCORE = CRPScore
 
 from src.models.training import prepare_training_data
 from data.database import DatabaseManager
@@ -181,20 +172,32 @@ def evaluate_ensemble_calibration(models, feature_order, X_test, y_test, current
               f"Deviation={deviation:+.1%} {status}")
 
 
-def train_ngboost_ensemble(n_models=5):
+def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_weighting=True, lr=0.03, minibatch=0.05, num_games=None):
     """
     Train ensemble of NGBoost models to predict score remainder distribution.
-    
-    Each model is trained on a bootstrap sample of games (not events).
     """
+    global DISTRIBUTION, SCORE
+    
+    if dist_name.lower() == 'safet':
+        DISTRIBUTION = SafeT
+        SCORE = LogScore
+    elif dist_name.lower() == 'normal':
+        DISTRIBUTION = Normal
+        SCORE = LogScore
+    else:
+        DISTRIBUTION = Laplace
+        SCORE = CRPScore
+
     print("=" * 80)
-    print(f"Training NGBoost Ensemble ({n_models} models)")
-    print(f"Distribution: {DISTRIBUTION.__name__}")
+    print(f"Training NGBoost (Models: {n_models}, Quick: {quick})")
+    print(f"Distribution: {DISTRIBUTION.__name__}, Score: {SCORE.__name__}")
     print("=" * 80)
     
     # 1. Load training data
     print("\nLoading training data...")
-    X, y_binary = prepare_training_data()
+    # Global num_games priority: num_games arg > quick (200) > None (All)
+    effective_num_games = num_games if num_games is not None else (200 if quick else None)
+    X, y_binary = prepare_training_data(num_games=effective_num_games)
     
     # 2. Get final score differentials for each game
     print("Getting final score differentials...")
@@ -243,6 +246,25 @@ def train_ngboost_ensemble(n_models=5):
     print(f"\nTraining: {len(X_train)} events, {len(train_ids)} games")
     print(f"Test: {len(X_test)} events, {len(test_ids)} games")
     
+    # Calculate sample weights for the entire training set
+    print("\nCalculating sample weights (Season + Time)...")
+    train_full_df = X[train_mask]
+    season_weights_map = {
+        '2022-23': 1.0,
+        '2023-24': 1.0,
+        '2024-25': 1.5,
+        '2025-26': 2.0
+    }
+    s_weights = train_full_df['season'].map(season_weights_map).fillna(1.0)
+    t_weights = np.sqrt(train_full_df['seconds_remaining'] + 60)
+    raw_weights = (s_weights * t_weights).values
+    if not use_weighting:
+        print("  [A/B TEST] DISABLING all sample weighting (Setting all weights to 1.0)")
+        raw_weights = np.ones_like(raw_weights)
+    
+    # Normalize weights to have mean 1.0 to keep learning rate stable
+    sample_weights_train = raw_weights / np.mean(raw_weights)
+    
     # 6. Train ensemble with game-level bootstrapping
     print(f"\nTraining {n_models} NGBoost models with game-level bootstrapping...")
     print("Each model trains on ~80% of games (bootstrap sample)")
@@ -268,13 +290,16 @@ def train_ngboost_ensemble(n_models=5):
         
         X_boot = X_train.values[boot_mask]
         y_boot = y_train.values[boot_mask] if hasattr(y_train, 'values') else y_train[boot_mask]
+        w_boot = sample_weights_train[boot_mask]
         
         # Create validation set (10% of bootstrap) for early stopping
         val_size = int(0.1 * len(X_boot))
         X_train_boot = X_boot[:-val_size]
         y_train_boot = y_boot[:-val_size]
+        w_train_boot = w_boot[:-val_size]
         X_val_boot = X_boot[-val_size:]
         y_val_boot = y_boot[-val_size:]
+        w_val_boot = w_boot[-val_size:]
         
         print(f"  Bootstrap: {len(X_train_boot)} train, {len(X_val_boot)} val")
         
@@ -283,28 +308,34 @@ def train_ngboost_ensemble(n_models=5):
         # For faster training, we rely on smaller minibatch_frac instead
         from sklearn.tree import DecisionTreeRegressor
         base_learner = DecisionTreeRegressor(
-            max_depth=3,           # Shallower trees for speed
-            min_samples_leaf=50,   # Allow finer granularity
-            max_features=1.0       # Use ALL features (no subsampling)
+            max_depth=5,           # Increased depth for better variance manifold
+            min_samples_leaf=30,   # Allow finer granularity
+            max_features=1.0       # Use ALL features
         )
         
-        # Train model with Student-T + LogScore
-        print(f"  Training NGBoost (max 300 iters, early stopping enabled)...")
+        # Train model with distribution-appropriate scoring
+        print(f"  Training NGBoost (max 1000 iters, high-patience early stopping)...")
         model = NGBRegressor(
             Dist=DISTRIBUTION,
-            Score=LogScore,          # LogScore required for Student-T
+            Score=SCORE,             
             Base=base_learner,
-            n_estimators=300,        # Max iterations
-            learning_rate=0.05,      # Higher LR for faster convergence
-            minibatch_frac=0.01,     # Small minibatch for speed
-            tol=1e-4,                # Early stopping threshold
-            col_sample=1.0,          # Use all features
+            n_estimators=1000,       # Increased runway
+            learning_rate=lr,      
+            minibatch_frac=minibatch,     
+            tol=1e-5,                # Finer tolerance
+            col_sample=1.0,          
             verbose=True,
-            verbose_eval=10,
+            verbose_eval=10,         # Less spam
             random_state=42 + i
         )
-        # Fit with validation set for early stopping
-        model.fit(X_train_boot, y_train_boot, X_val=X_val_boot, Y_val=y_val_boot)
+        # Fit with validation set and sample weights
+        model.fit(
+            X_train_boot, y_train_boot, 
+            X_val=X_val_boot, Y_val=y_val_boot,
+            sample_weight=w_train_boot,
+            val_sample_weight=w_val_boot,
+            early_stopping_rounds=100  # FORCED SCALE CONVERGENCE
+        )
         
         ensemble.append(model)
         
@@ -390,6 +421,20 @@ if __name__ == "__main__":
     
     parser = argparse.ArgumentParser(description='Train NGBoost Ensemble')
     parser.add_argument('--n-models', type=int, default=5, help='Number of models in ensemble')
+    parser.add_argument('--quick', action='store_true', help='Debug mode: 200 games only')
+    parser.add_argument('--dist', type=str, default='laplace', help='safet, laplace, or normal')
+    parser.add_argument('--no-weighting', action='store_true', help='Disable season/time weighting')
+    parser.add_argument('--lr', type=float, default=0.03, help='Learning rate')
+    parser.add_argument('--minibatch', type=float, default=0.03, help='Minibatch fraction')
+    parser.add_argument('--num-games', type=int, default=None, help='Specific number of games to train on')
     args = parser.parse_args()
     
-    ensemble, features = train_ngboost_ensemble(n_models=args.n_models)
+    ensemble, features = train_ngboost_ensemble(
+        n_models=args.n_models, 
+        quick=args.quick,
+        dist_name=args.dist,
+        use_weighting=not args.no_weighting,
+        lr=args.lr,
+        minibatch=args.minibatch,
+        num_games=args.num_games
+    )

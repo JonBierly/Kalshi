@@ -75,6 +75,7 @@ def load_closed_trades(start_date=None, end_date=None):
             # Model Edge at Entry = abs(Fill Price - Fair Value)
             # Note: We use fill_price now, not order_price
             df['entry_edge'] = abs(df['fill_price'] - df['model_fair_value'])
+            df = df[df['entry_edge'] >= 2]
             
             # CI Width (Uncertainty)
             df['ci_width'] = df['model_ci_upper'] - df['model_ci_lower']

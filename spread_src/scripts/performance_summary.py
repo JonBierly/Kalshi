@@ -40,10 +40,11 @@ def parse_args():
     parser.add_argument("--end-date", type=str, help="End date (YYYY-MM-DD)")
     parser.add_argument("--all", action='store_true', help="Use all available data")
     parser.add_argument("--output-dir", type=str, default="reports", help="Base output directory")
+    parser.add_argument("--min-edge", type=float, default=2.0, help="Minimum edge in cents to include in analysis")
     return parser.parse_args()
 
 
-def load_trades_from_db(start_date=None, end_date=None):
+def load_trades_from_db(start_date=None, end_date=None, min_edge=2.0):
     """Load trades from local database for a date range."""
     if not os.path.exists(DB_PATH):
         print(f"❌ Database not found at {DB_PATH}")
@@ -91,6 +92,7 @@ def load_trades_from_db(start_date=None, end_date=None):
         # Derived fields
         # Edge = difference between model fair value and fill price (in cents)
         df['edge'] = abs(df['model_fair_value'] - df['fill_price'])
+        df = df[df['edge'] >= min_edge]
         df['ci_width'] = df['model_ci_upper'] - df['model_ci_lower']
         df['mins_remaining'] = df['seconds_remaining'] / 60.0
         
@@ -287,11 +289,11 @@ def analyze_edge_summary(df, output_dir):
         print("  No filled trades to analyze")
         return {}
     
-    # Create edge buckets (in cents)
+    # Create granular edge buckets (in cents)
     filled['edge_bucket'] = pd.cut(
         filled['edge'],
-        bins=[0, 5, 10, 15, 20, 30, 100],
-        labels=['0-5¢', '5-10¢', '10-15¢', '15-20¢', '20-30¢', '30¢+']
+        bins=[0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 100],
+        labels=['0-2¢', '2-4¢', '4-6¢', '6-8¢', '8-10¢', '10-12¢', '12-14¢', '14-16¢', '16-18¢', '18-20¢', '20-25¢', '25-30¢', '30¢+']
     )
     
     edge_stats = filled.groupby('edge_bucket', observed=True).agg({
@@ -395,6 +397,128 @@ def analyze_time_summary(df, output_dir):
     plt.close()
     
     return time_stats.to_dict('records')
+
+
+def analyze_time_distribution(df, output_dir):
+    """Generate histogram of time remaining for filled trades."""
+    print("\n📊 Time Distribution Analysis...")
+    
+    filled = df[df['status'].isin(['filled', 'settled', 'closed'])].copy()
+    
+    if filled.empty or filled['mins_remaining'].isna().all():
+        print("  No time data available")
+        return {}
+        
+    mean_val = filled['mins_remaining'].mean()
+    median_val = filled['mins_remaining'].median()
+    
+    print(f"  Mean time remaining: {mean_val:.1f} mins")
+    print(f"  Median time remaining: {median_val:.1f} mins")
+    
+    # Plot
+    fig, ax = plt.subplots(figsize=(12, 6))
+    sns.histplot(filled['mins_remaining'], bins=48, kde=True, color='purple', ax=ax)
+    
+    ax.axvline(mean_val, color='red', linestyle='--', linewidth=2, label=f'Mean: {mean_val:.1f}m')
+    ax.axvline(median_val, color='green', linestyle='-', linewidth=2, label=f'Median: {median_val:.1f}m')
+    
+    ax.set_xlabel('Minutes Remaining')
+    ax.set_ylabel('Number of Trades')
+    ax.set_title('Distribution of Filled Trades by Game Time')
+    ax.set_xlim(48, 0) # Invert X to show game flow
+    ax.legend()
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'time_distribution.png', dpi=150)
+    plt.close()
+    
+    return {
+        'mean_mins': mean_val,
+        'median_mins': median_val
+    }
+
+
+def analyze_joint_time_edge_pnl(df, output_dir):
+    """Analyze P&L across both time remaining and edge demanded using a heatmap."""
+    print("\n📊 Joint Time-Edge Analysis...")
+    
+    filled = df[df['status'].isin(['filled', 'settled', 'closed'])].copy()
+    
+    if filled.empty or filled['mins_remaining'].isna().all() or filled['edge'].isna().all():
+        print("  Insufficient data for joint analysis")
+        return
+    
+    # Create buckets for heatmap
+    # Time: 4-minute chunks (12 buckets total, 3 per quarter)
+    filled['time_chunk'] = pd.cut(
+        filled['mins_remaining'],
+        bins=[0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48],
+        labels=[
+            'Q4: 0-4m', 'Q4: 4-8m', 'Q4: 8-12m', 
+            'Q3: 12-16m', 'Q3: 16-20m', 'Q3: 20-24m',
+            'Q2: 24-28m', 'Q2: 28-32m', 'Q2: 32-36m',
+            'Q1: 36-40m', 'Q1: 40-44m', 'Q1: 44-48m'
+        ]
+    )
+    
+    # Edge: Granular 2-cent chunks
+    filled['edge_chunk'] = pd.cut(
+        filled['edge'],
+        bins=[0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 25, 30, 100],
+        labels=['0-2¢', '2-4¢', '4-6¢', '6-8¢', '8-10¢', '10-12¢', '12-14¢', '14-16¢', '16-18¢', '18-20¢', '20-25¢', '25-30¢', '30¢+']
+    )
+    
+    # Pivot for heatmap: Mean realized_pnl
+    pivot_table = filled.pivot_table(
+        index='time_chunk', 
+        columns='edge_chunk', 
+        values='realized_pnl', 
+        aggfunc='mean',
+        observed=True
+    )
+    
+    # Counter for volume
+    pivot_counts = filled.pivot_table(
+        index='time_chunk', 
+        columns='edge_chunk', 
+        values='trade_id', 
+        aggfunc='count',
+        observed=True
+    )
+    
+    # Reverse index to show game chronologically (top to bottom)
+    labels_rev = [
+        'Q1: 44-48m', 'Q1: 40-44m', 'Q1: 36-40m',
+        'Q2: 32-36m', 'Q2: 28-32m', 'Q2: 24-28m',
+        'Q3: 20-24m', 'Q3: 16-20m', 'Q3: 12-16m',
+        'Q4: 8-12m', 'Q4: 4-8m', 'Q4: 0-4m'
+    ]
+    pivot_table = pivot_table.reindex(labels_rev)
+    pivot_counts = pivot_counts.reindex(labels_rev)
+    
+    # Increase height for more rows
+    fig, ax = plt.subplots(figsize=(22, 12))
+
+    # Create annotation string (Value + Count)
+    annot = pivot_table.copy().astype(str)
+    for i in range(pivot_table.shape[0]):
+        for j in range(pivot_table.shape[1]):
+            val = pivot_table.iloc[i, j]
+            count = pivot_counts.iloc[i, j]
+            if pd.isna(val):
+                annot.iloc[i, j] = ""
+            else:
+                annot.iloc[i, j] = f"${val:+.2f}\n(n={int(count)})"
+
+    sns.heatmap(pivot_table, annot=annot, fmt="", cmap='RdYlGn', center=0, ax=ax, vmin=-0.2, vmax=0.25, cbar_kws={'label': 'Avg Realized P&L ($)'})
+    
+    ax.set_title('Avg P&L per Trade: Game Time vs Edge Demanded')
+    ax.set_ylabel('Game Phase')
+    ax.set_xlabel('Edge Demanded (cents)')
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'joint_time_edge_pnl.png', dpi=150)
+    plt.close()
 
 
 def analyze_market_spread_summary(df, output_dir):
@@ -502,6 +626,115 @@ def analyze_spread_line_summary(df, output_dir):
     plt.close()
     
     return line_stats.to_dict('records')
+
+
+def analyze_side_performance(df, output_dir):
+    """Compare performance of longs (buy) vs shorts (sell)."""
+    print("\n📊 Long vs Short Analysis...")
+    
+    filled = df[df['status'].isin(['filled', 'settled', 'closed'])].copy()
+    
+    if filled.empty:
+        print("  No filled trades to analyze")
+        return {}
+    
+    side_stats = filled.groupby('side').agg({
+        'trade_id': 'count',
+        'realized_pnl': ['sum', 'mean'],
+    }).reset_index()
+    side_stats.columns = ['side', 'trades', 'total_pnl', 'avg_pnl']
+    
+    # Map side to readable names if needed (usually 'buy'/'sell')
+    side_stats['label'] = side_stats['side'].apply(lambda x: 'Long (BUY)' if x.lower() == 'buy' else 'Short (SELL)')
+    
+    print(side_stats[['label', 'trades', 'total_pnl', 'avg_pnl']].to_string(index=False))
+    
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    fig.suptitle('Performance: Long (BUY) vs Short (SELL)', fontsize=14)
+    
+    # Left: Total P&L
+    colors = ['green' if x >= 0 else 'red' for x in side_stats['total_pnl']]
+    axes[0].bar(side_stats['label'], side_stats['total_pnl'], color=colors, alpha=0.7)
+    axes[0].set_ylabel('Total realized P&L ($)')
+    axes[0].set_title('Total P&L')
+    axes[0].axhline(0, color='black', linewidth=0.5)
+    
+    # Right: Avg P&L per Trade
+    colors2 = ['green' if x >= 0 else 'red' for x in side_stats['avg_pnl']]
+    axes[1].bar(side_stats['label'], side_stats['avg_pnl'], color=colors2, alpha=0.7)
+    axes[1].set_ylabel('Avg Profit per Trade ($)')
+    axes[1].set_title('Efficiency (Profit per Trade)')
+    axes[1].axhline(0, color='black', linewidth=0.5)
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'side_performance.png', dpi=150)
+    plt.close()
+    
+    return side_stats.to_dict('records')
+
+
+def analyze_side_phase_performance(df, output_dir):
+    """Compare longs vs shorts across game phases."""
+    print("\n📊 Long vs Short by Game Phase...")
+    
+    filled = df[df['status'].isin(['filled', 'settled', 'closed'])].copy()
+    
+    if filled.empty or filled['mins_remaining'].isna().all():
+        print("  No data for phase analysis")
+        return {}
+    
+    # 4-minute chunks (12 buckets total, 3 per quarter)
+    filled['time_bucket'] = pd.cut(
+        filled['mins_remaining'],
+        bins=[0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48],
+        labels=[
+            'Q4: 0-4m', 'Q4: 4-8m', 'Q4: 8-12m', 
+            'Q3: 12-16m', 'Q3: 16-20m', 'Q3: 20-24m',
+            'Q2: 24-28m', 'Q2: 28-32m', 'Q2: 32-36m',
+            'Q1: 36-40m', 'Q1: 40-44m', 'Q1: 44-48m'
+        ]
+    )
+    
+    side_phase = filled.groupby(['time_bucket', 'side'], observed=True).agg({
+        'realized_pnl': 'mean',
+        'trade_id': 'count'
+    }).reset_index()
+    side_phase.columns = ['time_bucket', 'side', 'avg_pnl', 'count']
+    
+    # Map side
+    side_phase['side_label'] = side_phase['side'].apply(lambda x: 'LONG (BUY)' if x.lower() == 'buy' else 'SHORT (SELL)')
+    
+    # Set chronological order (Q1 -> Q4)
+    chrono_order = [
+        'Q1: 44-48m', 'Q1: 40-44m', 'Q1: 36-40m',
+        'Q2: 32-36m', 'Q2: 28-32m', 'Q2: 24-28m',
+        'Q3: 20-24m', 'Q3: 16-20m', 'Q3: 12-16m',
+        'Q4: 8-12m', 'Q4: 4-8m', 'Q4: 0-4m'
+    ]
+    side_phase['time_bucket'] = pd.Categorical(side_phase['time_bucket'], categories=chrono_order, ordered=True)
+    side_phase = side_phase.sort_values('time_bucket')
+    
+    # Plot
+    plt.figure(figsize=(18, 8))
+    sns.barplot(data=side_phase, x='time_bucket', y='avg_pnl', hue='side_label', palette='RdYlGn_r') # Inverted so SELL is more distinct if needed, or just standard
+    
+    plt.axhline(0, color='black', linewidth=1.0)
+    plt.title('High-Res Strategy Performance: Longs vs Shorts by Game Phase (4min Buckets)')
+    plt.ylabel('Avg Realized P&L ($)')
+    plt.xlabel('Game Phase (Opening -> Finish)')
+    plt.xticks(rotation=45, ha='right')
+    plt.grid(axis='y', linestyle='--', alpha=0.5)
+    
+    # Add counts above bars
+    # Using a slightly offset position for text is tricky with seaborn barplot, but we can try
+    # or just keep it clean.
+    
+    plt.tight_layout()
+    plt.savefig(output_dir / 'side_phase_performance.png', dpi=150)
+    plt.close()
+    
+    return side_phase.to_dict('records')
 
 
 def analyze_daily_summary(df, output_dir):
@@ -671,7 +904,7 @@ def main():
     
     # Load data
     print("\n📥 Loading data from database...")
-    df = load_trades_from_db(start_date, end_date)
+    df = load_trades_from_db(start_date, end_date, min_edge=args.min_edge)
     
     if df.empty:
         print("❌ No trades found!")
@@ -687,7 +920,12 @@ def main():
     analyses['game_roi'] = analyze_game_roi(df, output_dir)
     analyses['edge'] = analyze_edge_summary(df, output_dir)
     analyses['time'] = analyze_time_summary(df, output_dir)
+    analyses['time_dist'] = analyze_time_distribution(df, output_dir)
+    analyses['joint_time_edge'] = analyze_joint_time_edge_pnl(df, output_dir)
     analyses['market_spread'] = analyze_market_spread_summary(df, output_dir)
+    # New analysis for longs vs shorts
+    analyses['side'] = analyze_side_performance(df, output_dir)
+    analyses['side_phase'] = analyze_side_phase_performance(df, output_dir)
     analyses['spread_line'] = analyze_spread_line_summary(df, output_dir)
     analyses['daily'] = analyze_daily_summary(df, output_dir)
     

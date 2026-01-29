@@ -95,6 +95,7 @@ def load_trades_from_db(date_str):
     # Derived fields
     # Edge = difference between model fair value and fill price (in cents)
     df['edge'] = abs(df['model_fair_value'] - df['fill_price'])
+    df = df[df['edge'] >= 2]
     df['ci_width'] = df['model_ci_upper'] - df['model_ci_lower']
     df['mins_remaining'] = df['seconds_remaining'] / 60.0
     

@@ -1,32 +1,36 @@
 ============================================================
-PERFORMANCE SUMMARY: 2025-12-12 to 2026-01-27
-Generated: 2026-01-27 18:54:02
+PERFORMANCE SUMMARY: 2025-12-12 to 2026-01-29
+Generated: 2026-01-29 09:58:10
 ============================================================
 
 📊 OVERALL STATISTICS
 ----------------------------------------
-Date Range: 2025-12-12 to 2026-01-27
-Trading Days: 40
-Total Orders: 56432
-Total Fills: 13058
-Fill Rate: 23.1%
-Total P&L: $494.62
-Avg P&L per Trade: $0.038
+Date Range: 2025-12-12 to 2026-01-29
+Trading Days: 42
+Total Orders: 13447
+Total Fills: 13447
+Fill Rate: 100.0%
+Total P&L: $436.49
+Avg P&L per Trade: $0.033
 
 📈 GAME ROI SUMMARY
 ----------------------------------------
-Games Traded: 253
-Total Investment: $9770.49
-Total Profit: $494.62
-Overall ROI: 5.1%
+Games Traded: 267
+Total Investment: $9274.14
+Total Profit: $436.49
+Overall ROI: 4.7%
 
 📁 FILES GENERATED
 ----------------------------------------
 • time_analysis.png
+• side_performance.png
 • daily_performance.png
+• joint_time_edge_pnl.png
 • edge_histogram.png
+• time_distribution.png
 • edge_analysis.png
 • game_roi_analysis.png
+• side_phase_performance.png
 • spread_line_analysis.png
 • market_spread_analysis.png
 • summary.txt

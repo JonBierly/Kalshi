@@ -18,7 +18,7 @@ def prepare_training_data(num_games=None):
     session = db_manager.get_session()
     from src.data.database import Game
     # Filter for valid games only (non-zero team IDs)
-    query = session.query(Game.game_id, Game.home_team_id, Game.away_team_id)\
+    query = session.query(Game.game_id, Game.home_team_id, Game.away_team_id, Game.season)\
         .filter(Game.home_team_id != 0, Game.away_team_id != 0)
         
     if num_games:
@@ -32,7 +32,7 @@ def prepare_training_data(num_games=None):
     all_live_features = []
     all_targets = []
     
-    for game_id, home_id, away_id in games_meta:
+    for game_id, home_id, away_id, season in games_meta:
         query = f"SELECT * FROM pbp_events WHERE game_id = '{game_id}' ORDER BY period, remaining_time DESC"
         pbp_df = pd.read_sql(query, db_manager.engine)
         
@@ -42,6 +42,7 @@ def prepare_training_data(num_games=None):
         pbp_df['away_team_id'] = away_id
         
         features_df = create_live_features(pbp_df)
+        features_df['season'] = season # Include season for weighting
         
         # Determine winner (Target)
         final_row = pbp_df.iloc[-1]

@@ -52,7 +52,7 @@ class SimpleLiveTrader:
         dry_run: bool = True,
         max_game_exposure: float = 10.0,
         max_ticker_exposure: float = 3.0,
-        min_edge: float = 0.04,
+        min_edge: float = 0.08,
     ):
         """
         Initialize trader.
@@ -301,6 +301,11 @@ class SimpleLiveTrader:
                 wait_reason = f"{wait_reason} and {trader_reason}" if wait_reason else trader_reason
             print(f"  ⏳ WARM-UP: Waiting for {wait_reason}")
         
+        # Skip First Quarter (Q1) - Analysis shows this is low-profit/high-noise
+        if period == 1 or total_seconds > 2160:
+            print(f"  ⏳ Skipping: First Quarter (Q1) analysis active")
+            return []
+            
         # Skip late game
         if total_seconds < 120:
             print(f"  ⏰ Skipping: <2 min left")
@@ -308,27 +313,25 @@ class SimpleLiveTrader:
         
         # Build features
         live_features = self._build_features(game, score_diff, total_seconds, period)
-        
-        # Debug: show ALL features being sent to model
-        print(f"  === LIVE FEATURES ===")
-        print(f"  Game: pace={live_features.get('live_pace', 0):.1f}, momentum={live_features.get('score_momentum', 0):.1f}, vol={live_features.get('score_volatility', 0):.1f}, lead_swaps={live_features.get('lead_changes', 0)}")
-        print(f"  3P: home={live_features.get('home_3p_reliance', 0):.1%}, away={live_features.get('away_3p_reliance', 0):.1%}")
-        print(f"  Base: diff={score_diff:+d}, secs={int(total_seconds)}, home_efg={live_features.get('home_efg', 0):.3f}, away_efg={live_features.get('away_efg', 0):.3f}")
-        print(f"        to_diff={live_features.get('turnover_diff', 0):.1f}, reb_rate={live_features.get('home_rebound_rate', 0):.3f}, catchup={live_features.get('required_catchup_rate', 0):.4f}")
-        print(f"  Team: home_off={live_features.get('home_team_recent_off_rtg', 0):.1f}, home_def={live_features.get('home_team_recent_def_rtg', 0):.1f}, pace={live_features.get('home_team_recent_pace', 0):.1f}")
-        print(f"        away_off={live_features.get('away_team_recent_off_rtg', 0):.1f}, away_def={live_features.get('away_team_recent_def_rtg', 0):.1f}, pace={live_features.get('away_team_recent_pace', 0):.1f}")
-        # Roster features
-        print(f"  Roster: home_pie={live_features.get('home_roster_recent_pie', 0):.3f}, away_pie={live_features.get('away_roster_recent_pie', 0):.3f}")
-        
-        # Interaction features for variance
         enriched = add_interaction_features(live_features)
-        print(f"  Interactions: time_x_margin={enriched.get('time_x_margin', 0):.1f}, log_time={enriched.get('log_time', 0):.2f}, proportion={enriched.get('time_proportion', 0):.2f}")
-        print(f"                close={enriched.get('close_game', 0)}, blowout={enriched.get('blowout', 0)}")
+        
+        # Debug: show categorized features being sent to model
+        print(f"  === LIVE FEATURE CONTEXT ===")
+        print(f"  [Game State]  pace={live_features.get('live_pace', 0):.1f}, swaps={live_features.get('lead_changes', 0)}, momentum_2m={live_features.get('momentum_2min', 0.0):+.1f}")
+        print(f"  [Efficiency]  home_efg={live_features.get('home_efg', 0):.1%}, away_efg={live_features.get('away_efg', 0):.1%}, catchup={live_features.get('required_catchup_rate', 0):.3f}")
+        print(f"  [Team Form]   home_SOS={live_features.get('home_team_recent_SOS', 0):.3f}, home_std={live_features.get('home_team_recent_scoring_consistency', 0):.1f}")
+        print(f"                away_SOS={live_features.get('away_team_recent_SOS', 0):.3f}, away_std={live_features.get('away_team_recent_scoring_consistency', 0):.1f}")
+        
+        # PRIOR DECAY VISUALIZATION
+        print(f"  [Prior Decay] home_season_margin: {enriched.get('home_season_margin_x_time', 0):+.2f} (from {live_features.get('home_team_season_win_margin', 0):+.1f})")
+        print(f"                away_season_margin: {enriched.get('away_season_margin_x_time', 0):+.2f} (from {live_features.get('away_team_season_win_margin', 0):+.1f})")
+        
+        print(f"  [Variance]    time_x_margin={enriched.get('time_x_margin', 0):.1f}, log_time={enriched.get('log_time', 0):.2f}, volatility={enriched.get('score_volatility', 0):.2f}")
         
         # Get model prediction (NGBoost learns uncertainty directly, no manual multiplier needed)
         params = self.spread_model.predict_distribution_params(live_features)
-        mean_diff = np.mean(params['mean'])
-        std_diff = np.mean(params['std'])
+        mean_diff = float(np.mean(params['mean']))
+        std_diff = float(np.mean(params['std']))
         print(f"  Model: {mean_diff:+.1f} ± {std_diff:.1f}")
         
         # Evaluate each market
@@ -401,7 +404,7 @@ class SimpleLiveTrader:
             self._model_fair_values[market.ticker] = model_prob * 100
             
             # Edge indicator
-            if best_edge >= 0.04:
+            if best_edge >= self.trader.min_edge:
                 edge_str = f"✅ {best_edge:.1%}"
             elif best_edge >= 0.02:
                 edge_str = f"🟡 {best_edge:.1%}"
@@ -701,24 +704,25 @@ class SimpleLiveTrader:
                 locs.append(dist.loc[0])
                 scales.append(dist.scale[0])
                 dfs.append(dist.df[0] if hasattr(dist, 'df') else 30.0)
-            
+            enriched = add_interaction_features(live_features)
             driving_features = {
-                "live": {
+                "live_state": {
                     "Pace": f"{live_features.get('live_pace', 0):.1f}",
                     "Momentum": f"{live_features.get('score_momentum', 0):+.1f}",
                     "Home eFG%": f"{live_features.get('home_efg', 0):.1%}",
                     "Away eFG%": f"{live_features.get('away_efg', 0):.1%}",
-                    "TO Diff": f"{live_features.get('turnover_diff', 0):+d}",
+                    "Catchup Rate": f"{live_features.get('required_catchup_rate', 0):.4f}",
                 },
-                "team_recent": {
-                    "Home OffRtg": f"{live_features.get('home_team_recent_off_rtg', 0):.1f}",
-                    "Home DefRtg": f"{live_features.get('home_team_recent_def_rtg', 0):.1f}",
-                    "Away OffRtg": f"{live_features.get('away_team_recent_off_rtg', 0):.1f}",
-                    "Away DefRtg": f"{live_features.get('away_team_recent_def_rtg', 0):.1f}",
+                "team_context": {
+                    "Home Margin": f"{live_features.get('home_team_recent_win_margin', 0):+.1f}",
+                    "Home SOS": f"{live_features.get('home_team_recent_SOS', 0):.3f}",
+                    "Away Margin": f"{live_features.get('away_team_recent_win_margin', 0):+.1f}",
+                    "Away SOS": f"{live_features.get('away_team_recent_SOS', 0):.3f}",
                 },
-                "volatility": {
+                "variance_drivers": {
                     "Lead Changes": live_features.get('lead_changes', 0),
                     "Volatility": f"{live_features.get('score_volatility', 0):.2f}",
+                    "Time x Margin": f"{enriched.get('time_x_margin', 0):.0f}",
                 }
             }
             
@@ -888,7 +892,7 @@ def main():
     
     parser = argparse.ArgumentParser(description='Simple +EV Trader')
     parser.add_argument('--live', action='store_true', help='Run in live mode (real money)')
-    parser.add_argument('--min-edge', type=float, default=0.04, help='Min edge to trade')
+    parser.add_argument('--min-edge', type=float, default=0.08, help='Min edge to trade')
     parser.add_argument('--interval', type=int, default=15, help='Seconds between iterations')
     
     args = parser.parse_args()

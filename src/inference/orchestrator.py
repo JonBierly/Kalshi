@@ -142,7 +142,9 @@ class LiveGameOrchestrator:
                     'reb': home_team['statistics']['reboundsTotal'],
                     'pts': home_team['score'],
                     'fta': home_team['statistics']['freeThrowsAttempted'],
-                    'oreb': home_team['statistics']['reboundsOffensive']
+                    'oreb': home_team['statistics']['reboundsOffensive'],
+                    'stl': home_team['statistics'].get('steals', 0),
+                    'blk': home_team['statistics'].get('blocks', 0)
                 })
                 
                 self.feature_engine.away_stats.update({
@@ -153,7 +155,9 @@ class LiveGameOrchestrator:
                     'reb': away_team['statistics']['reboundsTotal'],
                     'pts': away_team['score'],
                     'fta': away_team['statistics']['freeThrowsAttempted'],
-                    'oreb': away_team['statistics']['reboundsOffensive']
+                    'oreb': away_team['statistics']['reboundsOffensive'],
+                    'stl': away_team['statistics'].get('steals', 0),
+                    'blk': away_team['statistics'].get('blocks', 0)
                 })
                 
                 # Construct "Event Row" for the remaining features (Score, Time)

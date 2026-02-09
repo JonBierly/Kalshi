@@ -2,7 +2,7 @@ import joblib
 import pandas as pd
 import numpy as np
 import time
-from spread_src.features.engineering import FeatureEngine, TeamStatsEngine, RosterEngine, BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST
+from spread_src.features.engineering import FeatureEngine, TeamStatsEngine, RosterEngine, BASE_FEATURES_LIST, ADVANCED_FEATURES_LIST, INTERACTION_FEATURES_LIST
 
 class PredictionEngine:
     def __init__(self, model_type='lr', model_path=None):
@@ -62,7 +62,7 @@ class PredictionEngine:
         """Predicts win probability and confidence interval given live features."""
         start_time = time.time()
         
-        feature_order = BASE_FEATURES_LIST + ADVANCED_FEATURES_LIST
+        feature_order = BASE_FEATURES_LIST + ADVANCED_FEATURES_LIST + INTERACTION_FEATURES_LIST
         
         # Ensure all columns are present, filling missing with 0
         row_data = {col: live_features.get(col, 0.0) for col in feature_order}

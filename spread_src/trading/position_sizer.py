@@ -68,13 +68,13 @@ class PositionSizer:
         else:
             ci_width = 0.15  # fallback default
         
-        # No edge on conservative basis = min size
+        # No edge on conservative basis = No trade
         if edge <= 0:
-            return min_size
+            return 0
         
         # Avoid division issues
         if price < 1 or price > 99 or bankroll < 0.10:
-            return min_size
+            return 0
         
         # Kelly percentage: f = (edge / 100) / ((100 - price) / 100) for a binary contract
         # Standard binary Kelly: f = (p * b - q) / b where b is odds-1
@@ -94,47 +94,49 @@ class PositionSizer:
         # Round and apply bounds
         size = int(round(kelly_size))
         
-        # Adjust for existing position
+        # MIN SIZE FLOOR: If we have positive conservative edge, try to get at least 1 contract
+        # but only if bankroll > cost of 1 contract.
+        if size < 1 and edge > 0 and bankroll >= dollars_per_contract:
+            size = 1
+            
+        # Adjust for existing position (Reduce size as position grows)
         size = self._adjust_for_position(size, position)
         
-        # Hard bounds
-        size = max(min_size, min(max_size, size))
+        # Apply HARD MAX only. 
+        size = min(max_size, size)
         
-        return size
+        return max(0, size)
     
     def _adjust_for_uncertainty(self, kelly_pct: float, ci_width: float) -> float:
         """
         Reduce Kelly percentage if model is uncertain.
-        
-        Args:
-            kelly_pct: Raw Kelly percentage
-            ci_width: Confidence interval width (0-1)
-            
-        Returns:
-            Adjusted Kelly percentage
         """
         # Apply configured Kelly fraction
         adjusted = kelly_pct * self.kelly_fraction
         
-        # Further reduce if very uncertain (wide CI > 25%)
-        if ci_width > 0.25:
+        # Further reduce if very uncertain (wide CI > 18% is very wide for spread markets)
+        if ci_width > 0.18:
             adjusted *= 0.5  # Half-quarter-Kelly
         
         return adjusted
     
     def _adjust_for_position(self, size: int, position: int) -> int:
         """
-        Reduce size if already have significant position.
-        
-        Args:
-            size: Calculated Kelly size
-            position: Current position
-            
-        Returns:
-            Adjusted size
+        Reduce size if already have a significant position to prevent doubling down on blowouts.
         """
-        # Reduce if already positioned (> 3 contracts)
-        if abs(position) > 3:
-            size = max(1, size // 2)
+        abs_pos = abs(position)
+        
+        # Increased CAP: No more than 20 contracts per ticker 
+        # (This is still a safety valve, but much higher as requested)
+        if abs_pos >= 20:
+            return 0
+        
+        # Relaxed scaling: Only start throttling size after 10 contracts
+        if abs_pos >= 15:
+            return min(size, 1)
+        if abs_pos >= 10:
+            return size // 4
+        if abs_pos >= 5:
+            return size // 2
         
         return size

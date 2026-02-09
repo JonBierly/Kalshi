@@ -172,7 +172,7 @@ def evaluate_ensemble_calibration(models, feature_order, X_test, y_test, current
               f"Deviation={deviation:+.1%} {status}")
 
 
-def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_weighting=True, lr=0.03, minibatch=0.05, num_games=None):
+def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_weighting=True, lr=0.03, minibatch=0.05, num_games=None, model_path='models/nba_spread_ngboost_new.pkl'):
     """
     Train ensemble of NGBoost models to predict score remainder distribution.
     """
@@ -314,7 +314,7 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
         )
         
         # Train model with distribution-appropriate scoring
-        print(f"  Training NGBoost (max 1000 iters, high-patience early stopping)...")
+        print(f"  Training NGBoost (max 500 iters, high-patience early stopping)...")
         model = NGBRegressor(
             Dist=DISTRIBUTION,
             Score=SCORE,             
@@ -334,7 +334,7 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
             X_val=X_val_boot, Y_val=y_val_boot,
             sample_weight=w_train_boot,
             val_sample_weight=w_val_boot,
-            early_stopping_rounds=100  # FORCED SCALE CONVERGENCE
+            early_stopping_rounds=75  # FORCED SCALE CONVERGENCE
         )
         
         ensemble.append(model)
@@ -408,7 +408,7 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
         'n_models': n_models
     }
     
-    model_path = 'models/nba_spread_ngboost.pkl'
+    os.makedirs(os.path.dirname(model_path), exist_ok=True)
     joblib.dump(model_data, model_path)
     print(f"✓ Saved {n_models}-model NGBoost ensemble to '{model_path}'")
     print("=" * 80)
@@ -422,13 +422,19 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train NGBoost Ensemble')
     parser.add_argument('--n-models', type=int, default=5, help='Number of models in ensemble')
     parser.add_argument('--quick', action='store_true', help='Debug mode: 200 games only')
-    parser.add_argument('--dist', type=str, default='laplace', help='safet, laplace, or normal')
+    parser.add_argument('--dist', type=str, default='safet', help='safet, laplace, or normal')
     parser.add_argument('--no-weighting', action='store_true', help='Disable season/time weighting')
     parser.add_argument('--lr', type=float, default=0.03, help='Learning rate')
     parser.add_argument('--minibatch', type=float, default=0.03, help='Minibatch fraction')
     parser.add_argument('--num-games', type=int, default=None, help='Specific number of games to train on')
+    parser.add_argument('--name', type=str, default='nba_spread_ngboost_new.pkl', help='Output model name')
     args = parser.parse_args()
     
+    # Ensure name ends in .pkl and lives in models/
+    out_name = args.name
+    if not out_name.endswith('.pkl'): out_name += '.pkl'
+    if not out_name.startswith('models/'): out_name = os.path.join('models', out_name)
+
     ensemble, features = train_ngboost_ensemble(
         n_models=args.n_models, 
         quick=args.quick,
@@ -436,5 +442,6 @@ if __name__ == "__main__":
         use_weighting=not args.no_weighting,
         lr=args.lr,
         minibatch=args.minibatch,
-        num_games=args.num_games
+        num_games=args.num_games,
+        model_path=out_name
     )

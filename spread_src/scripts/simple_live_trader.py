@@ -50,8 +50,8 @@ class SimpleLiveTrader:
         kalshi_key_id: str,
         kalshi_key_path: str = 'key.key',
         dry_run: bool = True,
-        max_game_exposure: float = 10.0,
-        max_ticker_exposure: float = 3.0,
+        max_game_exposure: float = 15.0,
+        max_ticker_exposure: float = 5.0,
         min_edge: float = 0.08,
     ):
         """
@@ -110,7 +110,7 @@ class SimpleLiveTrader:
                 print(f"  {event_short}: {len(tickers)} markets")
         
         # Initialize tracker (loads NGBoost model internally)
-        model_path = 'models/nba_spread_ngboost.pkl'
+        model_path = 'models/nba_spread_ngboost_new.pkl'
         self.tracker = SpreadTracker(kalshi_key_id, kalshi_key_path, model_path=model_path)
         
         # Reuse the model from tracker
@@ -121,6 +121,7 @@ class SimpleLiveTrader:
         
         # Warm-up tracking
         self.game_tracking_start = {}  # {game_id: start_time}
+        self.latest_market_data = {}   # {ticker: {bid, ask, model_prob}}
         print("✓ Ready")
     
     def run(self, interval: int = 10):
@@ -146,6 +147,7 @@ class SimpleLiveTrader:
                 
                 # Refresh state
                 self.portfolio.refresh_state(self.kalshi)
+                self.latest_market_data = {} # Reset for this iteration
                 
                 # Check fills
                 fills = self.order_mgr.check_for_fills()
@@ -250,7 +252,9 @@ class SimpleLiveTrader:
                 'reb': home_stats.get('reboundsTotal', 0),
                 'pts': live_data['homeTeam']['score'],
                 'fta': home_stats.get('freeThrowsAttempted', 0),
-                'oreb': home_stats.get('reboundsOffensive', 0)
+                'oreb': home_stats.get('reboundsOffensive', 0),
+                'stl': home_stats.get('steals', 0),
+                'blk': home_stats.get('blocks', 0)
             })
             self.tracker.orch.feature_engine.away_stats.update({
                 'fgm': away_stats.get('fieldGoalsMade', 0),
@@ -260,7 +264,9 @@ class SimpleLiveTrader:
                 'reb': away_stats.get('reboundsTotal', 0),
                 'pts': live_data['awayTeam']['score'],
                 'fta': away_stats.get('freeThrowsAttempted', 0),
-                'oreb': away_stats.get('reboundsOffensive', 0)
+                'oreb': away_stats.get('reboundsOffensive', 0),
+                'stl': away_stats.get('steals', 0),
+                'blk': away_stats.get('blocks', 0)
             })
         
         # Extract game info
@@ -276,6 +282,24 @@ class SimpleLiveTrader:
         away_tri = game['awayTeam']['teamTricode']
         
         print(f"\n{away_tri} {away_score} @ {home_tri} {home_score} | {int(total_seconds//60)}:{int(total_seconds%60):02d} left")
+        
+        # Optimized: Batch refresh market prices for this game
+        # Extract event prefix from the first market
+        if spread_markets:
+            try:
+                parts = spread_markets[0].ticker.rsplit('-', 1)
+                event_ticker = parts[0] if len(parts) >= 2 else spread_markets[0].ticker
+                fresh_markets = self.kalshi.get_event_markets(event_ticker)
+                if fresh_markets:
+                    # Create lookup
+                    price_lookup = {m['ticker']: m for m in fresh_markets}
+                    for m in spread_markets:
+                        if m.ticker in price_lookup:
+                            item = price_lookup[m.ticker]
+                            m.yes_bid = item.get('yes_bid', 0)
+                            m.yes_ask = item.get('yes_ask', 0)
+            except Exception as e:
+                print(f"  ⚠️ Failed to refresh market prices: {e}")
         
         # Track when we first saw this game for warm-up
         if game_id not in self.game_tracking_start:
@@ -332,6 +356,34 @@ class SimpleLiveTrader:
         params = self.spread_model.predict_distribution_params(live_features)
         mean_diff = float(np.mean(params['mean']))
         std_diff = float(np.mean(params['std']))
+        
+        # Store for dashboard export
+        if not hasattr(self, '_dashboard_cache'):
+            self._dashboard_cache = {}
+        
+        # Get distribution components for dashboard
+        X_live = pd.DataFrame([{col: enriched.get(col, 0.0) for col in self.spread_model.feature_order}], 
+                              columns=self.spread_model.feature_order)
+        locs, scales, dfs = [], [], []
+        for model in self.spread_model.ensemble:
+            dist = model.pred_dist(X_live.values)
+            locs.append(dist.loc[0])
+            scales.append(dist.scale[0])
+            dfs.append(dist.df[0] if hasattr(dist, 'df') else 30.0)
+            
+        self._dashboard_cache[game_id] = {
+            "score_diff": score_diff,
+            "total_seconds": total_seconds,
+            "period": period,
+            "live_features": live_features,
+            "enriched": enriched,
+            "distribution": {
+                "loc": np.mean(locs) + score_diff,
+                "scale": np.mean(scales),
+                "df": np.mean(dfs)
+            }
+        }
+        
         print(f"  Model: {mean_diff:+.1f} ± {std_diff:.1f}")
         
         # Evaluate each market
@@ -341,14 +393,8 @@ class SimpleLiveTrader:
         print(f"  {'-'*12} {'-'*12} {'-'*20} {'-'*12}")
         
         for market in spread_markets:
-            # Refresh market prices
-            try:
-                fresh = self.kalshi.get_market_details(market.ticker)
-                if fresh:
-                    market.yes_bid = fresh.get('yes_bid', market.yes_bid)
-                    market.yes_ask = fresh.get('yes_ask', market.yes_ask)
-            except:
-                pass
+            # Refresh market prices (DEPRECATED: Now handled via batch refresh above)
+            pass
             
             is_home = (market.team == home_tri)
             threshold = market.spread
@@ -367,6 +413,15 @@ class SimpleLiveTrader:
                 model_prob = 1 - result['probabilities'][0]
                 ci_lower = 1 - result['ci_90_upper'][0]
                 ci_upper = 1 - result['ci_90_lower'][0]
+            
+            # Store for order management and dashboard
+            self.latest_market_data[market.ticker] = {
+                'bid': market.yes_bid,
+                'ask': market.yes_ask,
+                'model_prob': model_prob,
+                'ci_lower': ci_lower,
+                'ci_upper': ci_upper
+            }
             
             # Log prediction for every market evaluated (regardless of trade)
             self.trade_logger.log_prediction(
@@ -448,15 +503,26 @@ class SimpleLiveTrader:
             key = (order.ticker, order.side)
             current_opp = opp_lookup.get(key)
             
-            if not current_opp:
-                # No longer want this position
-                print(f"  ❌ Cancel {order.order_id}: No edge")
+            # Get latest data for this ticker
+            md = self.latest_market_data.get(order.ticker)
+            if not md:
+                # No data for this market this iteration (game skipped or finished) - cancel
+                print(f"  ❌ Cancel {order.order_id}: No current market data")
                 self._cancel_order_with_logging(order.order_id)
                 continue
+                
+            # Use the trader's logic to check if we should cancel
+            should_cancel, reason = self.trader.should_cancel_order(
+                order_side='yes', # Spread markets are always 'yes' side
+                order_action=order.side, # 'buy' or 'sell'
+                order_price=int(order.price),
+                model_prob=md['model_prob'],
+                current_bid=md['bid'],
+                current_ask=md['ask']
+            )
             
-            # Check if price changed significantly
-            if abs(order.price - current_opp.price) > 2:
-                print(f"  ❌ Cancel {order.order_id}: Price changed")
+            if should_cancel:
+                print(f"  ❌ Cancel {order.order_id}: {reason}")
                 self._cancel_order_with_logging(order.order_id)
     
     def _cancel_order_with_logging(self, order_id: str):
@@ -566,7 +632,7 @@ class SimpleLiveTrader:
                 
                 if is_reducing:
                     # Position-reducing orders are always allowed - close full position
-                    size = min(10, abs(current_pos))
+                    size = min(20, abs(current_pos))
                     print(f"    {market_name} {opp.action.upper()}: CLOSING pos={current_pos}, size={size} ✅")
                 else:
                     # Position-increasing: check exposure limit first
@@ -589,16 +655,24 @@ class SimpleLiveTrader:
                     size = self.position_sizer.calculate_size(
                         fair_value=fair_value,
                         price=opp.price,
-                        bankroll=bankroll,
+                        bankroll=remaining_game, # Use full game budget for Kelly math
                         action=opp.action,
                         ci_lower=opp.ci_lower,
                         ci_upper=opp.ci_upper,
                         position=current_pos,
                         min_size=1,
-                        max_size=10
+                        max_size=20
                     )
+                    
+                    # Clamp to individual ticker limit
+                    cost_per = opp.price / 100.0
+                    ticker_cap_contracts = int(remaining_ticker / cost_per)
+                    if size > ticker_cap_contracts:
+                        size = ticker_cap_contracts
                 
                 if size < 1:
+                    if opp.edge >= self.trader.min_edge:
+                        print(f"    {market_name} {opp.action.upper()}: SKIPPED (size=0) - Edge {opp.edge:.1%} check Kelly vs bankroll ${remaining_game:.2f}")
                     continue
                 
                 # Calculate actual exposure for this size
@@ -679,32 +753,14 @@ class SimpleLiveTrader:
             game = match['nba_game']
             game_id = game['gameId']
             
-            # Use cached prediction data
-            live_data = self.tracker.orch.live_client.get_live_game_data(game_id)
-            if not live_data:
+            # Use cached prediction data from _evaluate_game
+            cache = getattr(self, '_dashboard_cache', {}).get(game_id)
+            if not cache:
                 continue
                 
-            home_score = live_data['homeTeam']['score']
-            away_score = live_data['awayTeam']['score']
+            live_features = cache["live_features"]
+            enriched = cache["enriched"]
             
-            period = live_data.get('period', 0)
-            game_clock = live_data.get('gameClock', 'PT0M00.00S')
-            total_seconds = self._parse_time(period, game_clock)
-            
-            # Rebuild features for export
-            live_features = self._build_features(game, home_score - away_score, total_seconds, period)
-            
-            # Get distribution params
-            X_live = pd.DataFrame([{col: live_features.get(col, 0.0) for col in self.spread_model.feature_order}], 
-                                  columns=self.spread_model.feature_order)
-            
-            locs, scales, dfs = [], [], []
-            for model in self.spread_model.ensemble:
-                dist = model.pred_dist(X_live.values)
-                locs.append(dist.loc[0])
-                scales.append(dist.scale[0])
-                dfs.append(dist.df[0] if hasattr(dist, 'df') else 30.0)
-            enriched = add_interaction_features(live_features)
             driving_features = {
                 "live_state": {
                     "Pace": f"{live_features.get('live_pace', 0):.1f}",
@@ -712,6 +768,8 @@ class SimpleLiveTrader:
                     "Home eFG%": f"{live_features.get('home_efg', 0):.1%}",
                     "Away eFG%": f"{live_features.get('away_efg', 0):.1%}",
                     "Catchup Rate": f"{live_features.get('required_catchup_rate', 0):.4f}",
+                    "Steals": f"H:{self.tracker.orch.feature_engine.home_stats.get('stl',0)} A:{self.tracker.orch.feature_engine.away_stats.get('stl',0)}",
+                    "Blocks": f"H:{self.tracker.orch.feature_engine.home_stats.get('blk',0)} A:{self.tracker.orch.feature_engine.away_stats.get('blk',0)}"
                 },
                 "team_context": {
                     "Home Margin": f"{live_features.get('home_team_recent_win_margin', 0):+.1f}",
@@ -730,18 +788,20 @@ class SimpleLiveTrader:
                 "game_id": game_id,
                 "home_team": game['homeTeam']['teamTricode'],
                 "away_team": game['awayTeam']['teamTricode'],
-                "home_score": home_score,
-                "away_score": away_score,
-                "seconds_remaining": total_seconds,
-                "period": period,
-                "distribution": {
-                    "loc": np.mean(locs) + (home_score - away_score),
-                    "scale": np.mean(scales),
-                    "df": np.mean(dfs)
-                },
+                "home_score": cache["score_diff"] + (cache["total_seconds"] * 0), # Placeholder for home_score extraction if needed elsewhere
+                "away_score": 0, # Placeholder
+                "seconds_remaining": cache["total_seconds"],
+                "period": cache["period"],
+                "distribution": cache["distribution"],
                 "driving_features": driving_features,
                 "markets": []
             }
+            
+            # Correct scores from live data if possible
+            live_data = self.tracker.orch.live_client.get_live_game_data(game_id)
+            if live_data:
+                game_state["home_score"] = live_data['homeTeam']['score']
+                game_state["away_score"] = live_data['awayTeam']['score']
             
             for market in match['spread_markets']:
                 market_orders = [o for o in self.order_mgr.get_open_orders() if o.ticker == market.ticker]

@@ -109,7 +109,9 @@ class SpreadTracker:
                         'reb': h_stats.get('reboundsTotal', 0),
                         'pts': h_pts,
                         'fta': h_stats.get('freeThrowsAttempted', 0),
-                        'oreb': h_stats.get('reboundsOffensive', 0)
+                        'oreb': h_stats.get('reboundsOffensive', 0),
+                        'stl': h_stats.get('steals', 0),
+                        'blk': h_stats.get('blocks', 0)
                     })
                     self.orch.feature_engine.away_stats.update({
                         'fgm': a_stats.get('fieldGoalsMade', 0),
@@ -119,7 +121,9 @@ class SpreadTracker:
                         'reb': a_stats.get('reboundsTotal', 0),
                         'pts': a_pts,
                         'fta': a_stats.get('freeThrowsAttempted', 0),
-                        'oreb': a_stats.get('reboundsOffensive', 0)
+                        'oreb': a_stats.get('reboundsOffensive', 0),
+                        'stl': a_stats.get('steals', 0),
+                        'blk': a_stats.get('blocks', 0)
                     })
                     
                     import re

@@ -36,29 +36,42 @@ def analyze_feature_importance(model_path='models/nba_spread_ngboost_normal.pkl'
     print(f"Features: {n_features}")
     
     # Aggregate feature importances across ensemble
-    # NGBoost returns (n_params, n_features) - row 0 is loc, row 1 is scale
+    # NGBoost returns (n_params, n_features)
+    # Row 0: Location (mean)
+    # Row 1: Scale (uncertainty)
+    # Row 2: DF (tails) - only for Student-T
     loc_importances = np.zeros(n_features)
     scale_importances = np.zeros(n_features)
+    df_importances = np.zeros(n_features)
     
+    n_params = 1
     for model in ensemble:
         if hasattr(model, 'feature_importances_'):
             fi = model.feature_importances_
             if fi.ndim == 2:
-                loc_importances += fi[0]  # Location (mean)
-                scale_importances += fi[1]  # Scale (uncertainty)
+                n_params = fi.shape[0]
+                loc_importances += fi[0]
+                if n_params >= 2:
+                    scale_importances += fi[1]
+                if n_params >= 3:
+                    df_importances += fi[2]
             else:
                 loc_importances += fi
     
     # Normalize
     loc_importances = loc_importances / loc_importances.sum() if loc_importances.sum() > 0 else loc_importances
     scale_importances = scale_importances / scale_importances.sum() if scale_importances.sum() > 0 else scale_importances
-    combined = (loc_importances + scale_importances) / 2
+    df_importances = df_importances / df_importances.sum() if df_importances.sum() > 0 else df_importances
+    
+    # Combined importance is the average across all active parameters
+    combined = (loc_importances + scale_importances + (df_importances if n_params >= 3 else 0)) / n_params
     
     # Create DataFrame for display
     importance_df = pd.DataFrame({
         'Feature': feature_order,
         'Mean (loc)': loc_importances,
         'Uncertainty (scale)': scale_importances,
+        'Tails (df)': df_importances if n_params >= 3 else 0,
         'Combined': combined
     }).sort_values('Combined', ascending=False)
     
@@ -66,13 +79,13 @@ def analyze_feature_importance(model_path='models/nba_spread_ngboost_normal.pkl'
     print("\n" + "=" * 80)
     print("TOP 20 FEATURES (by combined importance)")
     print("=" * 80)
-    print(f"\n{'Rank':<5} {'Feature':<35} {'Mean':<12} {'Uncert':<12} {'Combined':<12}")
-    print("-" * 76)
+    print(f"\n{'Rank':<5} {'Feature':<35} {'Mean':<10} {'Uncert':<10} {'Tails':<10} {'Combined':<10}")
+    print("-" * 88)
     
     cumulative = 0
     for rank, (_, row) in enumerate(importance_df.head(20).iterrows(), 1):
         cumulative += row['Combined']
-        print(f"{rank:<5} {row['Feature']:<35} {row['Mean (loc)']:.4f}       {row['Uncertainty (scale)']:.4f}       {row['Combined']:.4f}")
+        print(f"{rank:<5} {row['Feature']:<35} {row['Mean (loc)']:.4f}   {row['Uncertainty (scale)']:.4f}   {row['Tails (df)']:.4f}   {row['Combined']:.4f}")
     
     print(f"\n  Top 20 features explain {cumulative:.1%} of variance")
     

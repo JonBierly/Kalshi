@@ -61,10 +61,6 @@ class TeamStatsEngine:
         df_merged['stl_rate'] = df_merged['stl'] / df_merged['possessions']
         df_merged['blk_rate'] = df_merged['blk'] / df_merged['possessions']
         
-        # New defensive stats
-        df_merged['stl_rate'] = df_merged['stl'] / df_merged['possessions']
-        df_merged['blk_rate'] = df_merged['blk'] / df_merged['possessions']
-        
         # Calculate SOS (Strength of Schedule)
         # We need the opponent's win percentage entering the game.
         # This is a bit of a circular dependency in rolling, so we'll do an approximating merge.
@@ -308,6 +304,23 @@ class RosterEngine:
                     w = recent_weights[valid]
                     if w.sum() > 0:
                         item[metric_name] = np.average(team_p.loc[valid, col], weights=w)
+        
+        # Star Impact: Top 3 and Top 5 PIE (Weighted average of the heavy hitters)
+        if 'player_recent_pie' in team_p.columns:
+            # Sort by PERFORMANCE (PIE) to find the stars
+            top_players = team_p.sort_values('player_recent_pie', ascending=False).head(5)
+            # Weighted PIE of Top 3
+            t3 = top_players.head(3)
+            # Use minutes as weights for the average of these stars
+            w3 = t3['player_recent_min_float'].fillna(10).clip(lower=1)
+            item['roster_recent_top3_pie'] = np.average(t3['player_recent_pie'].fillna(0), weights=w3)
+                
+            # Missing Starter Count: How many of the Top 5 starters are effectively "gone"?
+            # Since this is a per-game feature, and we are in _precalc_roster_stats,
+            # this logic is slightly different during live inference.
+            # In training data, we just use the players who actually played.
+            # So "Missing_Starter_Count" doesn't quite apply here in historical view.
+        
         return item
         
     def _load_data(self):
@@ -503,7 +516,23 @@ class RosterEngine:
             for col in recent_cols:
                 metric_name = col.replace('player_', 'roster_')
                 feat_dict[metric_name] = 0.0
-                
+        
+        # Star Impact (Live Inference version)
+        if not active_players.empty and 'player_recent_pie' in active_players.columns:
+            # Top 3 PIE (Performance-based)
+            top3 = active_players.sort_values('player_recent_pie', ascending=False).head(3)
+            w3 = top3['player_recent_min_float'].fillna(1).clip(lower=1)
+            feat_dict['roster_recent_top3_pie'] = np.average(top3['player_recent_pie'].fillna(0), weights=w3)
+            
+            # Missing Starter Count
+            # 1. Identify "Expected Starters" (Top 5 players by recent mins in the ENTIRE team pool)
+            entire_team = self.latest_player_stats[self.latest_player_stats['team_id'] == team_id]
+            expected_starters = entire_team.sort_values('player_recent_min_float', ascending=False).head(5)['player_id'].tolist()
+            # 2. See how many are in our provided active_players list
+            active_ids = active_players['player_id'].tolist()
+            missing = [pid for pid in expected_starters if pid not in active_ids]
+            feat_dict['roster_missing_starter_count'] = len(missing)
+            
         return feat_dict
 
 class FeatureEngine:
@@ -758,8 +787,10 @@ ADVANCED_FEATURES_LIST = [
     # Roster recent performance (last 10 games)
     'home_roster_recent_est_off_rating', 'home_roster_recent_est_def_rating', 
     'home_roster_recent_est_usg_pct',
+    'home_roster_recent_top3_pie', 'home_roster_missing_starter_count',
     'away_roster_recent_est_off_rating', 'away_roster_recent_est_def_rating', 
-    'away_roster_recent_est_usg_pct'
+    'away_roster_recent_est_usg_pct',
+    'away_roster_recent_top3_pie', 'away_roster_missing_starter_count'
 ]
 
 VOLATILITY_FEATURES_LIST = [
@@ -774,7 +805,8 @@ INTERACTION_FEATURES_LIST = [
     'volatility_x_time',
     'home_season_margin_x_time', 'away_season_margin_x_time',
     'home_recent_margin_x_time', 'away_recent_margin_x_time',
-    'home_pie_x_time', 'away_pie_x_time'
+    'home_pie_x_time', 'away_pie_x_time',
+    'net_star_pie_diff'
 ]
 
 BASE_FEATURES_LIST = [
@@ -820,6 +852,9 @@ def add_interaction_features(df_or_dict):
         result['home_pie_x_time'] = result.get('home_roster_recent_pie', 0.1) * result['time_proportion']
         result['away_pie_x_time'] = result.get('away_roster_recent_pie', 0.1) * result['time_proportion']
         
+        # NEW: Star Difference
+        result['net_star_pie_diff'] = result.get('home_roster_recent_top3_pie', 0) - result.get('away_roster_recent_top3_pie', 0)
+        
         return result
     else:
         # DataFrame case (training)
@@ -845,5 +880,8 @@ def add_interaction_features(df_or_dict):
         df['away_recent_margin_x_time'] = df.get('away_team_recent_win_margin', 0.0) * df['time_proportion']
         df['home_pie_x_time'] = df.get('home_roster_recent_pie', 0.1) * df['time_proportion']
         df['away_pie_x_time'] = df.get('away_roster_recent_pie', 0.1) * df['time_proportion']
+        
+        # NEW: Star Difference
+        df['net_star_pie_diff'] = df.get('home_roster_recent_top3_pie', 0) - df.get('away_roster_recent_top3_pie', 0)
         
         return df

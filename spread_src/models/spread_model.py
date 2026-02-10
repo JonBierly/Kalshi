@@ -10,11 +10,12 @@ Instead of predicting discrete bins, we predict:
     P(final_score_diff > threshold) for any threshold
 """
 
+import joblib
+import os
 import numpy as np
 import pandas as pd
 from scipy import stats
 from typing import Dict, List
-import joblib
 
 from spread_src.features.engineering import add_interaction_features
 from spread_src.models.distributions import SafeT  # Required for pickle loading
@@ -54,66 +55,64 @@ class SpreadDistributionModel:
             self.feature_order = model_data['feature_order']
             self.distribution_type = model_data.get('distribution', 'Unknown')
             print(f"Loaded NGBoost ensemble ({self.n_models} models, {self.distribution_type} distribution)")
-            
         except FileNotFoundError:
             print(f"No model found at {models_path}")
             self.ensemble = None
             self.feature_order = []
             self.n_models = 0
-    
+            
     def predict_distribution_params(self, live_features: dict, variance_multiplier: float = 1.0) -> Dict[str, np.ndarray]:
+        """Simple wrapper for single prediction."""
+        return self.predict_distribution_params_batch([live_features], variance_multiplier)
+
+
+    def predict_distribution_params_batch(self, live_features_list: List[dict], variance_multiplier: float = 1.0) -> Dict[str, np.ndarray]:
         """
-        Predict distribution parameters from NGBoost ensemble.
+        Predict distribution parameters for a list of features efficiently.
         
         Returns:
             {
-                'mean': array of reconstructed final diffs from each model,
-                'std': array of true standard deviations from each model
+                'mean': (N_samples, N_models) array,
+                'std': (N_samples, N_models) array
             }
         """
         if self.ensemble is None:
             raise ValueError("No model loaded")
+        if not live_features_list:
+            return {'mean': np.array([]), 'std': np.array([])}
         
-        # ESSENTIAL: Compute interaction features (time_x_margin, log_time) 
-        # These are critical for variance prediction in NGBoost.
-        enriched_features = add_interaction_features(live_features)
+        # Batch preparation
+        enriched_list = [add_interaction_features(f) for f in live_features_list]
+        rows = []
+        for feat in enriched_list:
+            rows.append([feat.get(col, 0.0) for col in self.feature_order])
         
-        # Prepare features using stored feature order
-        row_data = {col: enriched_features.get(col, 0.0) for col in self.feature_order}
-        X_live = pd.DataFrame([row_data], columns=self.feature_order)
+        X_batch = pd.DataFrame(rows, columns=self.feature_order)
+        current_diffs = np.array([f.get('score_diff', 0.0) for f in enriched_list])
         
-        # Get current score diff for reconstruction
-        current_diff = enriched_features.get('score_diff', 0.0)
-        
-        means = []
-        stds = []
+        all_means = []
+        all_stds = []
         
         for model in self.ensemble:
-            dist = model.pred_dist(X_live.values)
-            predicted_remainder = dist.loc[0]
-            
-            # Distribution-specific standard deviation
-            scale = dist.scale[0]
+            dist = model.pred_dist(X_batch.values)
+            predicted_remainders = dist.loc
+            scales = dist.scale
             
             if self.distribution_type == 'Laplace' or isinstance(dist, Laplace):
-                # Variance of Laplace is 2 * b^2
-                true_std = scale * np.sqrt(2)
+                true_stds = scales * np.sqrt(2)
             else:
-                # Fallback to Student-T or Normal
-                df = dist.df[0] if hasattr(dist, 'df') else 30.0
-                if df > 2:
-                    true_std = scale * np.sqrt(df / (df - 2))
-                else:
-                    true_std = scale * 10.0
+                dfs = dist.df if hasattr(dist, 'df') else np.full(len(scales), 30.0)
+                # Use np.maximum to avoid division-by-zero warnings for df=2 (even though np.where masks them)
+                true_stds = np.where(dfs > 2, scales * np.sqrt(dfs / np.maximum(dfs - 2, 1e-6)), scales * 10.0)
+
             
-            # Reconstruct final diff
-            reconstructed_mean = current_diff + predicted_remainder
-            means.append(reconstructed_mean)
-            stds.append(true_std)
-        
+            reconstructed_means = current_diffs + predicted_remainders
+            all_means.append(reconstructed_means)
+            all_stds.append(true_stds)
+            
         return {
-            'mean': np.array(means),
-            'std': np.array(stds)
+            'mean': np.array(all_means).T, # Shape (N_samples, N_models)
+            'std': np.array(all_stds).T
         }
     
     def predict_spread_probabilities(self, live_features: dict, thresholds: List[float], variance_multiplier: float = 1.0) -> Dict:
@@ -145,6 +144,20 @@ class SpreadDistributionModel:
             predicted_remainder = dist.loc[0]
             scale = dist.scale[0]
             
+            # Use raw scale for distributions
+            if hasattr(dist, 'dist'):
+                 # It's a SafeT / Student-T wrapper
+                 df = dist.df[0] if hasattr(dist, 'df') else 30.0
+                 from scipy.stats import t as t_dist
+                 calibrated_dist = t_dist(df=df, loc=predicted_remainder, scale=scale)
+            elif isinstance(dist, Laplace):
+                 from scipy.stats import laplace
+                 calibrated_dist = laplace(loc=predicted_remainder, scale=scale)
+            else:
+                 # Fallback to normal
+                 from scipy.stats import norm
+                 calibrated_dist = norm(loc=predicted_remainder, scale=scale)
+            
             if self.distribution_type == 'Laplace' or isinstance(dist, Laplace):
                 true_std = scale * np.sqrt(2)
             else:
@@ -153,6 +166,7 @@ class SpreadDistributionModel:
                     true_std = scale * np.sqrt(df / (df - 2))
                 else:
                     true_std = scale * 10.0
+
             
             all_remainders.append(predicted_remainder)
             all_stds.append(true_std)
@@ -161,8 +175,8 @@ class SpreadDistributionModel:
             probs_for_model = []
             for threshold in thresholds:
                 adjusted_threshold = threshold - current_diff
-                # Student-T CDF is fat-tailed, unlike stats.norm
-                prob = 1 - dist.cdf(np.array([adjusted_threshold]))[0]
+                # Use the CALIBRATED distribution for CDF
+                prob = 1 - calibrated_dist.cdf(adjusted_threshold)
                 probs_for_model.append(prob)
             
             all_probs.append(probs_for_model)

@@ -217,23 +217,29 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
     X = add_interaction_features(X)
     print(f"  Added {len(INTERACTION_FEATURES_LIST)} interaction features")
     
-    # 4. Split by game ID (same as before)
+    # 4. Define Trading Window Filter (Exclude first 5m and last 2m)
+    # seconds_remaining: [120, 2580]
+    trading_window_mask = (X['seconds_remaining'] >= 120) & (X['seconds_remaining'] <= 2580)
+    print(f"\nTrading window filter: Keeping {trading_window_mask.sum()} / {len(X)} events")
+    
+    # 5. Split by game ID
     game_ids = X['game_id'].unique()
     train_ids, test_ids = train_test_split(game_ids, test_size=0.2, random_state=42)
     
-    train_mask = X['game_id'].isin(train_ids)
-    test_mask = X['game_id'].isin(test_ids)
+    # Combined mask: (Partition mask) AND (Trading Window mask)
+    train_mask = X['game_id'].isin(train_ids) & trading_window_mask
+    test_mask = X['game_id'].isin(test_ids) & trading_window_mask
     
-    # 5. Filter to feature columns (including interaction features)
+    # 6. Filter to feature columns (including interaction features)
     feature_cols = BASE_FEATURES_LIST + ADVANCED_FEATURES_LIST + INTERACTION_FEATURES_LIST
     available_cols = [c for c in feature_cols if c in X.columns]
     
-    print(f"\nUsing {len(available_cols)} features (including interactions)")
+    print(f"Using {len(available_cols)} features (including interactions)")
     
     X_train = X[train_mask][available_cols]
     X_test = X[test_mask][available_cols]
     
-    y_train = score_remainders[train_mask]
+    y_train_full = score_remainders[train_mask] # Temporarily hold to apply weights
     y_test = score_remainders[test_mask]
     
     train_game_ids = X[train_mask]['game_id'].values
@@ -243,12 +249,13 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
     test_current_diffs = current_diffs[test_mask]
     y_test_final_diffs = final_diffs[test_mask]
     
-    print(f"\nTraining: {len(X_train)} events, {len(train_ids)} games")
-    print(f"Test: {len(X_test)} events, {len(test_ids)} games")
+    print(f"Final Sets (Windowed): {len(X_train)} train events, {len(X_test)} test events")
     
     # Calculate sample weights for the entire training set
-    print("\nCalculating sample weights (Season + Time)...")
+    print("\nCalculating sample weights (New Strategy)...")
     train_full_df = X[train_mask]
+    
+    # Season weights (keep as is or slightly adjust)
     season_weights_map = {
         '2022-23': 1.0,
         '2023-24': 1.0,
@@ -256,14 +263,30 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
         '2025-26': 2.0
     }
     s_weights = train_full_df['season'].map(season_weights_map).fillna(1.0)
-    t_weights = np.sqrt(train_full_df['seconds_remaining'] + 60)
-    raw_weights = (s_weights * t_weights).values
+    
+    # 1. Reverse Time Weighting: Favor Late Game or keep it uniform
+    t_weights = 1.0 # Moving to uniform time weighting to avoid early-game bias
+    
+    # 2. Tight Game Boost: Increase weight for score_diff in [-12, 12]
+    tight_mask = train_full_df['score_diff'].abs() <= 12
+    tight_weights = np.where(tight_mask, 1.5, 1.0)
+
+    very_tight_mask = train_full_df['score_diff'].abs() <= 6
+    very_tight_weights = np.where(very_tight_mask, 2.0, 1.0)
+    
+    # 3. Clutch Boost: Increase weight for 4th quarter
+    clutch_mask = train_full_df['seconds_remaining'] < 720
+    clutch_weights = np.where(clutch_mask, 1.2, 1.0)
+    
+    raw_weights = (s_weights * t_weights * tight_weights * very_tight_weights * clutch_weights).values
+    
     if not use_weighting:
         print("  [A/B TEST] DISABLING all sample weighting (Setting all weights to 1.0)")
         raw_weights = np.ones_like(raw_weights)
     
-    # Normalize weights to have mean 1.0 to keep learning rate stable
+    # Normalize weights to have mean 1.0
     sample_weights_train = raw_weights / np.mean(raw_weights)
+    y_train = y_train_full # Finalize target reference
     
     # 6. Train ensemble with game-level bootstrapping
     print(f"\nTraining {n_models} NGBoost models with game-level bootstrapping...")
@@ -308,7 +331,7 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
         # For faster training, we rely on smaller minibatch_frac instead
         from sklearn.tree import DecisionTreeRegressor
         base_learner = DecisionTreeRegressor(
-            max_depth=5,           # Increased depth for better variance manifold
+            max_depth=5,           # Restored to production depth
             min_samples_leaf=30,   # Allow finer granularity
             max_features=1.0       # Use ALL features
         )
@@ -319,9 +342,9 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
             Dist=DISTRIBUTION,
             Score=SCORE,             
             Base=base_learner,
-            n_estimators=1000,       # Increased runway
+            n_estimators=1000,       # Restored to production runway
             learning_rate=lr,      
-            minibatch_frac=minibatch,     
+            minibatch_frac=minibatch,
             tol=1e-5,                # Finer tolerance
             col_sample=1.0,          
             verbose=True,
@@ -408,9 +431,9 @@ def train_ngboost_ensemble(n_models=12, quick=False, dist_name='laplace', use_we
         'n_models': n_models
     }
     
-    os.makedirs(os.path.dirname(model_path), exist_ok=True)
-    joblib.dump(model_data, model_path)
-    print(f"✓ Saved {n_models}-model NGBoost ensemble to '{model_path}'")
+    save_path = 'models/nba_spread_ngboost_v3_final.pkl'
+    joblib.dump(model_data, save_path)
+    print(f"\n✓ Saved final v3 model to '{save_path}'")
     print("=" * 80)
     
     return ensemble, available_cols

@@ -87,7 +87,7 @@ class RebalancingLiveTrader:
         self._sync_event_tickers()
         
         # Initialize tracker
-        model_path = 'models/nba_spread_ngboost.pkl'
+        model_path = 'models/nba_spread_ngboost_v3_final.pkl'
         self.tracker = SpreadTracker(kalshi_key_id, kalshi_key_path, model_path=model_path)
         self.spread_model = self.tracker.spread_model
         

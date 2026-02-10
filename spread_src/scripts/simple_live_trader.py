@@ -110,7 +110,7 @@ class SimpleLiveTrader:
                 print(f"  {event_short}: {len(tickers)} markets")
         
         # Initialize tracker (loads NGBoost model internally)
-        model_path = 'models/nba_spread_ngboost_new.pkl'
+        model_path = 'models/nba_spread_ngboost_v3_final.pkl'
         self.tracker = SpreadTracker(kalshi_key_id, kalshi_key_path, model_path=model_path)
         
         # Reuse the model from tracker

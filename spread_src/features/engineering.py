@@ -551,8 +551,8 @@ class FeatureEngine:
         self.lead_changes = 0
         self.last_leader = 0 # 1 for home, -1 for away, 0 for tie
 
-    def update(self, event_row: pd.Series):
-        """Updates game state based on a single PBP event row and returns the new feature vector."""
+    def lightweight_update(self, event_row: pd.Series):
+        """Updates internal state only, without calculating full features."""
         event_type = event_row.get('event_type', 0)
         description = str(event_row.get('description', '')).lower()
         
@@ -577,7 +577,6 @@ class FeatureEngine:
         elif event_type == 5 or 'turnover' in event_type_str: # Turnover
             stats['to'] += 1
             if 'steal' in description:
-                # The OTHER team got the steal
                 other_stats = self.away_stats if is_home else self.home_stats
                 other_stats['stl'] += 1
         elif 'free throw' in event_type_str:
@@ -585,7 +584,6 @@ class FeatureEngine:
             if 'miss' not in description:
                 stats['pts'] += 1
         elif 'block' in description:
-            # The OTHER team got the block
             other_stats = self.away_stats if is_home else self.home_stats
             other_stats['blk'] += 1
             
@@ -594,24 +592,41 @@ class FeatureEngine:
         if event_row['period'] <= 4:
             seconds_remaining += (4 - event_row['period']) * 720
             
-        # Update history for momentum (keep last 10 mins)
+        # Update history for momentum
         new_diff = event_row['score_diff']
-        self.history.append((seconds_remaining, new_diff))
+        if not self.history or self.history[-1][0] != seconds_remaining:
+            self.history.append((seconds_remaining, new_diff))
+            if len(self.history) > 1200: # Capped history
+                # Correct capping: keep entries where time difference is within 15 mins
+                self.history = [h for h in self.history if h[0] < seconds_remaining + 900]
+
+    def update(self, event_row: pd.Series):
+        """Updates game state and returns full feature vector (Legacy/Training use)."""
+        self.lightweight_update(event_row)
         
-        # Track Lead Changes
-        current_leader = np.sign(new_diff) if new_diff != 0 else 0
-        if current_leader != 0 and self.last_leader != 0 and current_leader != self.last_leader:
-            self.lead_changes += 1
-        if current_leader != 0:
-            self.last_leader = current_leader
-
-        if len(self.history) > 1000: # Safety cap
-             self.history = [h for h in self.history if h[0] < seconds_remaining + 600]
-
-        return self.calculate_current_features(event_row['score_diff'], seconds_remaining, event_row['period'], event_row['game_id'], event_row['home_team_id'], event_row['away_team_id'])
+        # Get derived time/diff for calculation
+        seconds_remaining = event_row['remaining_time']
+        if event_row['period'] <= 4:
+            seconds_remaining += (4 - event_row['period']) * 720
+            
+        return self.calculate_current_features(
+            event_row['score_diff'], seconds_remaining, event_row['period'], 
+            event_row['game_id'], event_row.get('home_team_id', 0), event_row.get('away_team_id', 0)
+        )
 
     def calculate_current_features(self, score_diff, seconds_remaining, period, game_id, home_id, away_id):
         """Calculates features from current internal state."""
+        
+        # STATEFUL UPDATE for Live Tracking
+        # If this is a new timestamp, add to history so momentum/volatility can be calculated
+        if not self.history or self.history[-1][0] != seconds_remaining:
+            self.history.append((seconds_remaining, score_diff))
+            
+            # Keep history capped to last 15 minutes of game time (900s)
+            # This matches the needs of 10min momentum + some buffer
+            if len(self.history) > 1000:
+                self.history = [h for h in self.history if h[0] < seconds_remaining + 900]
+                
         # Multi-window Momentum: Change in score diff over various windows
         windows = {
             'momentum_2min': 120,

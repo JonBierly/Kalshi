@@ -262,12 +262,55 @@ class MultiAssetRebalancer:
         self.derisk_band = derisk_band
         self.min_trade_spread = min_trade_spread
 
+    def get_execution_price(
+        self,
+        action: str,
+        bid: int,
+        ask: int,
+        edge: float,
+        seconds_remaining: float,
+        is_exit: bool
+    ) -> int:
+        """
+        Determine order price: maker (bid+1/ask-1) vs taker (ask/bid).
+        Crosses the spread when urgency is high enough and spread is reasonable.
+        """
+        spread = ask - bid
+        urgency = 0.0
+
+        # Edge urgency
+        if edge > 0.20:
+            urgency += 1.0
+        elif edge > 0.15:
+            urgency += 0.5
+
+        # Time urgency
+        if seconds_remaining < 300:  # < 5 min
+            urgency += 0.5
+        if seconds_remaining < 120:  # < 2 min
+            urgency += 0.5
+
+        # Exit urgency: closing -EV positions
+        if is_exit:
+            urgency += 0.5
+
+        # Cross the spread if urgency >= 1.0 and spread is reasonable
+        if urgency >= 1.0 and spread <= 8:
+            if action == 'buy':
+                return min(95, ask)       # Buy at the ask (take), cap at 95
+            else:
+                return max(5, bid)        # Sell at the bid (take), floor at 5
+        else:
+            if action == 'buy':
+                return max(5, min(95, bid + 1))   # Maker, buy cap at 95
+            else:
+                return max(5, min(99, ask - 1))   # Maker, sell allows up to 99
+
     def calculate_optimal_weights(
         self,
         tickers: List[str],
         probs: List[float],
         prices: List[float],
-        distribution: stats.rv_continuous  # The Student-T distribution object
     ) -> Dict[str, float]:
         """
         Calculate target Kelly weights for a set of markets in one game.
@@ -276,7 +319,6 @@ class MultiAssetRebalancer:
             tickers: List of tickers
             probs: Model probabilities P(hit)
             prices: Current market prices (normalized to 0-1)
-            distribution: The underlying Student-T distribution used to generate probs
             
         Returns:
             Dict mapping ticker to target weight (0.0 to 1.0)
@@ -361,20 +403,23 @@ class MultiAssetRebalancer:
     def evaluate_rebalancing(
         self,
         tickers: List[str],
-        current_weights: Dict[str, float], # current position / bankroll
-        optimal_weights: Dict[str, float], # smoothed optimal weights from SMA
+        current_weights: Dict[str, float],
+        optimal_weights: Dict[str, float],
         bids: Dict[str, int],
         asks: Dict[str, int],
-        individual_edges: Dict[str, float], # New: individual model edge per ticker
-        current_positions: Dict[str, int] = None, # New: actual contract counts
-        is_toxic: Dict[str, bool] = None,
-        min_scale_up_edge: float = 0.02 # 2% default min edge to buy
+        individual_edges: Dict[str, float],
+        current_positions: Dict[str, int] = None,
+        derisk_overrides: Dict[str, float] = None,
+        seconds_remaining: float = 600.0,
+        min_scale_up_edge: float = 0.02
     ) -> List[RebalancingAction]:
         """
-        Compare smoothed optimal to current and generate actions.
+        Compare optimal to current and generate actions.
+        Uses per-ticker derisk band overrides for -EV positions.
+        Uses urgency-based pricing (maker vs taker).
         """
         actions = []
-        is_toxic = is_toxic or {}
+        derisk_overrides = derisk_overrides or {}
         
         for ticker in tickers:
             opt_w = optimal_weights.get(ticker, 0.0)
@@ -387,55 +432,67 @@ class MultiAssetRebalancer:
             ask_p = asks.get(ticker, 100)
             market_spread = ask_p - bid_p
             
-            # ASYMMETRIC BANDS (with small epsilon for float robustness)
-            # Use a dampened target weight (dampened_opt_w) to slow down reactions
+            # Per-ticker derisk band (0% for -EV positions, default otherwise)
+            ticker_derisk = derisk_overrides.get(ticker, self.derisk_band)
+            
             dampened_opt_w = opt_w 
+            is_exit = False
             
             if diff > self.scale_up_band + 1e-9:
                 # SCALE UP (BUY)
-                # Apply min_trade_spread filter for entries/scale-ups
                 if market_spread < self.min_trade_spread:
                     continue
-                    
-                price = max(5, min(95, bid_p + 1))
-                # Re-calculate model_prob from mid-price and mid-edge
+                
                 mid_price = (bid_p + ask_p) / 2.0 / 100.0
                 model_prob = individual_edges.get(ticker, 0.0) + mid_price
-                exec_edge = model_prob - (price / 100.0)
+                exec_edge = model_prob - (bid_p + 1) / 100.0  # estimate with maker price
 
-                fee_impact = 0.0175 * (price/100.0) * (1.0 - price/100.0)
+                fee_impact = 0.0175 * ((bid_p + 1)/100.0) * (1.0 - (bid_p + 1)/100.0)
                 
                 if (exec_edge - fee_impact) < min_scale_up_edge:
                     continue
+                
+                # Get urgency-aware price
+                price = self.get_execution_price('buy', bid_p, ask_p, exec_edge, seconds_remaining, False)
+                # Recalculate exec_edge at actual execution price
+                exec_edge = model_prob - (price / 100.0)
                     
                 action_type = 'buy'
                 reason = "Multi-Asset Scale Up"
-                dampened_opt_w = curr_w + (diff * 0.5) # Only close 50% of the gap
+                dampened_opt_w = curr_w + (diff * 0.5)
                 
-            elif diff < -self.derisk_band - 1e-9:
-                # DERISK (SELL)
-                # If market spread is too tight, skip de-risking unless emergency
-                # This prevents "freak selling" when the spread tightens
+            elif diff < -ticker_derisk - 1e-9:
+                # DERISK (SELL) — uses per-ticker band
                 if market_spread < self.min_trade_spread and abs(curr_pos) > 0:
                     continue
-                    
-                # For de-risking (selling), we allow up to 99c because we are RELEASING capital
-                price = max(1, min(99, ask_p - 1))
+                
+                is_exit = (ticker_derisk < self.derisk_band)  # -EV exit
                 mid_price = (bid_p + ask_p) / 2.0 / 100.0
                 model_prob = individual_edges.get(ticker, 0.0) + mid_price
+                
+                # Get urgency-aware price
+                preliminary_edge = (ask_p - 1) / 100.0 - model_prob
+                price = self.get_execution_price('sell', bid_p, ask_p, abs(preliminary_edge), seconds_remaining, is_exit)
                 exec_edge = (price / 100.0) - model_prob
                 
-                if exec_edge < 0.01: # Minimal edge to bother de-risking if not forced
+                # For -EV exits, allow even small negative edge (crossing costs)
+                if not is_exit and exec_edge < 0.01:
                     continue
+                if is_exit and exec_edge < -0.10:
+                    continue  # Don't dump at >10% worse than fair
 
                 action_type = 'sell'
-                reason = "Multi-Asset De-risk"
-                dampened_opt_w = curr_w + (diff * 0.5) # Only close 50% of the gap
+                if is_exit:
+                    reason = "EV Exit"
+                elif curr_pos <= 0:
+                    reason = "Scale Up (Short)"
+                else:
+                    reason = "Multi-Asset De-risk"
+                dampened_opt_w = curr_w + (diff * 0.5)
                 
             elif (curr_pos > 0 and bid_p >= 95):
                 # GUARANTEED HARVESTING (LONG)
-                # Allow 99c for harvesting
-                price = max(1, min(99, ask_p - 1))
+                price = self.get_execution_price('sell', bid_p, ask_p, 0.5, seconds_remaining, True)
                 mid_price = (bid_p + ask_p) / 2.0 / 100.0
                 model_prob = individual_edges.get(ticker, 0.0) + mid_price
                 exec_edge = (price / 100.0) - model_prob
@@ -444,11 +501,10 @@ class MultiAssetRebalancer:
                 
                 action_type = 'sell'
                 reason = "Guaranteed Harvesting"
-                dampened_opt_w = 0 # Force exit
+                dampened_opt_w = 0
             elif (curr_pos < 0 and ask_p <= 5):
                 # GUARANTEED HARVESTING (SHORT)
-                # Allow 1c for harvesting
-                price = max(1, min(99, bid_p + 1))
+                price = self.get_execution_price('buy', bid_p, ask_p, 0.5, seconds_remaining, True)
                 mid_price = (bid_p + ask_p) / 2.0 / 100.0
                 model_prob = individual_edges.get(ticker, 0.0) + mid_price
                 exec_edge = model_prob - (price / 100.0)
@@ -457,36 +513,14 @@ class MultiAssetRebalancer:
 
                 action_type = 'buy'
                 reason = "Guaranteed Harvesting"
-                dampened_opt_w = 0 # Force exit
-            elif is_toxic.get(ticker, False):
-                # TOXIC EXIT (BYPASS BANDS)
-                # Allow full range for toxic exit
-                if curr_pos > 0:
-                    action_type = 'sell'
-                    price = max(1, min(99, ask_p - 1))
-                else:
-                    action_type = 'buy'
-                    price = max(1, min(99, bid_p + 1))
-                
-                mid_price = (bid_p + ask_p) / 2.0 / 100.0
-                model_prob = individual_edges.get(ticker, 0.0) + mid_price
-                exec_edge = (price / 100.0) - model_prob if action_type == 'sell' else model_prob - (price / 100.0)
-                
-                if exec_edge < -0.05: # Even for toxic, don't dump into a black hole?
-                    pass
-
-                reason = "Toxic Exit"
-                dampened_opt_w = 0 # Force exit
+                dampened_opt_w = 0
             else:
                 continue
 
-            # 2. Calculate Size robustly using Target Contracts
-            # Use the dampened target weight
+            # Calculate Size using dampened target weight
             if dampened_opt_w > 0:
-                # Target is LONG: dollar_cost is the market price (how much we pay)
                 target_pos = int((dampened_opt_w * self.bankroll) / (max(price, 1) / 100.0))
             elif dampened_opt_w < 0:
-                # Target is SHORT: dollar_cost is the exposure cost (100 - price)
                 sell_exposure = 100 - price
                 target_pos = -int((abs(dampened_opt_w) * self.bankroll) / (max(sell_exposure, 1) / 100.0))
             else:
@@ -495,6 +529,10 @@ class MultiAssetRebalancer:
             size = abs(target_pos - curr_pos)
 
             if size > 0:
+                # Skip black swan prices (≤5¢ or ≥95¢)
+                if int(price) <= 5 or int(price) >= 95:
+                    continue
+                    
                 actions.append(RebalancingAction(
                     ticker=ticker,
                     action=action_type,

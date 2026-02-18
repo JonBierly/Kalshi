@@ -113,10 +113,10 @@ class TestPatientRebalancer(unittest.TestCase):
         self.assertEqual(actions[0].action, 'sell')
 
     def test_emergency_bypasses_filter(self):
-        """Guaranteed harvesting and toxic exits should bypass the spread filter."""
+        """Guaranteed harvesting should bypass the spread filter."""
         current_weights = {"T1": 0.1}
         current_positions = {"T1": 5}
-        # Narrow spread (5c)
+        # Narrow spread (5c) at high prices
         bids = {"T1": 95}
         asks = {"T1": 100}
         
@@ -124,18 +124,19 @@ class TestPatientRebalancer(unittest.TestCase):
         optimal_weights = {"T1": 0.1}
         
         # Scenario: Guaranteed Harvesting (Bid >= 95)
-        # Price 95-100, mid is ~97.5, model edge is slightly positive
-        # harvesting allows price up to 99, exec_edge = 99 - 98.5 = 0.5% (Positive)
+        # Urgency pricing will cross the spread (sell at bid=95)
+        # Mid=97.5, edge=-0.10 -> model_prob = -0.10 + 0.975 = 0.875
+        # exec_edge = 0.95 - 0.875 = 0.075 (Positive → fills)
         actions = self.rebalancer.evaluate_rebalancing(
             self.tickers, current_weights, optimal_weights, bids, asks, 
-            {"T1": 0.01}, # small edge
+            {"T1": -0.10}, # model says fair value is below mid
             current_positions
         )
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].reason, "Guaranteed Harvesting")
 
     def test_hybrid_price_capping(self):
-        """Scale Up should cap at 95, but Derisk/Harvest can go to 99."""
+        """Scale Up should cap at 95. Derisk uses urgency-based pricing."""
         # 1. Scale Up (Buy) at 94-104 spread -> Should be capped at 95c
         # mid = 99, edge=0.05 -> prob = 1.04. buy = 95, edge = 0.09
         bids = {"T1": 94}
@@ -147,7 +148,10 @@ class TestPatientRebalancer(unittest.TestCase):
         self.assertEqual(len(actions), 1)
         self.assertEqual(actions[0].price, 95, "Scale up buy should be capped at 95")
 
-        # 2. Derisk (Sell) at 99c market -> Should be allowed at 98c (Ask-1)
+        # 2. Derisk (Sell) at 90-99 spread -> Urgency pricing applies
+        # Large edge negative: mid=0.945, edge=-0.05 -> model_prob=0.895
+        # Preliminary edge = |0.98 - 0.895| = 0.085 < 0.15 -> maker pricing
+        # At default 600s remaining, urgency < 1.0, so maker: ask-1 = 98
         bids = {"T1": 90}
         asks = {"T1": 99}
         actions = self.rebalancer.evaluate_rebalancing(
@@ -155,7 +159,7 @@ class TestPatientRebalancer(unittest.TestCase):
             {"T1": -0.05}, {"T1": 100}
         )
         self.assertEqual(len(actions), 1)
-        self.assertEqual(actions[0].price, 98, "Derisk sell should be Ask-1 (98)")
+        self.assertEqual(actions[0].price, 98, "Derisk sell should be Ask-1 (98) at low urgency")
 
 if __name__ == '__main__':
     unittest.main()

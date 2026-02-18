@@ -1,0 +1,56 @@
+DEBUG: Using spread_src/features/engineering.py
+Initializing Engines...
+Loaded NGBoost ensemble (5 models, SafeT distribution)
+Caching roster features...
+Building Team Map from DB...
+
+Fetching Active Spread Events...
+Found 10 events.
+
+Analyzing Markets vs Model...
+Game                 Mkt Width  Model CI Width  Model Pred           Rec. Spread    
+--------------------------------------------------------------------------------
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19DENLAC
+DEBUG: Found 10 markets for KXNBASPREAD-26FEB19DENLAC
+  [RosterEngine] WARNING: No player IDs provided for team 1610612746. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612743. Falling back to top 10 players.
+Prediction error for DEN@LAC: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19ORLSAC
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19ORLSAC
+  [RosterEngine] WARNING: No player IDs provided for team 1610612758. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612753. Falling back to top 10 players.
+Prediction error for ORL@SAC: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19BOSGSW
+DEBUG: Found 10 markets for KXNBASPREAD-26FEB19BOSGSW
+  [RosterEngine] WARNING: No player IDs provided for team 1610612744. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612738. Falling back to top 10 players.
+Prediction error for BOS@GSW: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19PHXSAS
+DEBUG: Found 10 markets for KXNBASPREAD-26FEB19PHXSAS
+  [RosterEngine] WARNING: No player IDs provided for team 1610612759. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612756. Falling back to top 10 players.
+Prediction error for PHX@SAS: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19TORCHI
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19TORCHI
+  [RosterEngine] WARNING: No player IDs provided for team 1610612741. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612761. Falling back to top 10 players.
+Prediction error for TOR@CHI: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19DETNYK
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19DETNYK
+  [RosterEngine] WARNING: No player IDs provided for team 1610612752. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612765. Falling back to top 10 players.
+Prediction error for DET@NYK: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19INDWAS
+Error fetching markets for event KXNBASPREAD-26FEB19INDWAS: 429 Client Error: Too Many Requests for url: https://api.elections.kalshi.com/trade-api/v2/markets?event_ticker=KXNBASPREAD-26FEB19INDWAS
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19HOUCHA
+Error fetching markets for event KXNBASPREAD-26FEB19HOUCHA: 429 Client Error: Too Many Requests for url: https://api.elections.kalshi.com/trade-api/v2/markets?event_ticker=KXNBASPREAD-26FEB19HOUCHA
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19BKNCLE
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19BKNCLE
+  [RosterEngine] WARNING: No player IDs provided for team 1610612739. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612751. Falling back to top 10 players.
+Prediction error for BKN@CLE: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19ATLPHI
+Error fetching markets for event KXNBASPREAD-26FEB19ATLPHI: 429 Client Error: Too Many Requests for url: https://api.elections.kalshi.com/trade-api/v2/markets?event_ticker=KXNBASPREAD-26FEB19ATLPHI
+
+Volume Granularity Check:
+Checking if 'volume' field in market details has timestamp info...

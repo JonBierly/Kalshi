@@ -1,0 +1,16 @@
+DEBUG: Using spread_src/features/engineering.py
+Initializing Engines...
+Loaded NGBoost ensemble (5 models, SafeT distribution)
+Caching roster features...
+Building Team Map from DB...
+
+Fetching Active Spread Events...
+Found 10 events.
+
+Analyzing Markets vs Model...
+Game                 Mkt Width  Model CI Width  Model Pred           Rec. Spread    
+--------------------------------------------------------------------------------
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19DENLAC
+DEBUG: Found 10 markets for KXNBASPREAD-26FEB19DENLAC
+  [RosterEngine] WARNING: No player IDs provided for team 1610612746. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612743. Falling back to top 10 players.

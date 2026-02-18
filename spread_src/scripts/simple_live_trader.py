@@ -53,6 +53,7 @@ class SimpleLiveTrader:
         max_game_exposure: float = 15.0,
         max_ticker_exposure: float = 5.0,
         min_edge: float = 0.08,
+        min_spread: int = 4,
     ):
         """
         Initialize trader.
@@ -64,10 +65,12 @@ class SimpleLiveTrader:
             max_game_exposure: Max $ at risk per game (default $10)
             max_ticker_exposure: Max $ at risk per ticker (default $3)
             min_edge: Minimum edge to trade (default 4%)
+            min_spread: Minimum bid-ask spread in cents to trade (default 4)
         """
         self.dry_run = dry_run
         self.max_game_exposure = max_game_exposure
         self.max_ticker_exposure = max_ticker_exposure
+        self.min_spread = min_spread
         
         print("=" * 80)
         print("SIMPLE +EV TRADER")
@@ -76,6 +79,7 @@ class SimpleLiveTrader:
         print(f"Max per game: ${max_game_exposure}")
         print(f"Max per ticker: ${max_ticker_exposure}")
         print(f"Min edge: {min_edge:.0%}")
+        print(f"Min spread: {min_spread}¢")
         print("=" * 80)
         
         # Initialize components
@@ -393,8 +397,14 @@ class SimpleLiveTrader:
         print(f"  {'-'*12} {'-'*12} {'-'*20} {'-'*12}")
         
         for market in spread_markets:
-            # Refresh market prices (DEPRECATED: Now handled via batch refresh above)
-            pass
+            # Skip markets with tight bid-ask spread (data shows these lose money)
+            bid = market.yes_bid or 0
+            ask = market.yes_ask or 0
+            market_spread = ask - bid if (bid > 0 and ask > 0) else 0
+            if market_spread < self.min_spread:
+                market_name = market.ticker.split('-')[-1] if '-' in market.ticker else market.ticker[-10:]
+                print(f"  {market_name:<12} {'SKIP':>12} spread {market_spread}¢ < {self.min_spread}¢ min")
+                continue
             
             is_home = (market.team == home_tri)
             threshold = market.spread
@@ -953,6 +963,7 @@ def main():
     parser = argparse.ArgumentParser(description='Simple +EV Trader')
     parser.add_argument('--live', action='store_true', help='Run in live mode (real money)')
     parser.add_argument('--min-edge', type=float, default=0.08, help='Min edge to trade')
+    parser.add_argument('--min-spread', type=int, default=4, help='Min bid-ask spread in cents (default 4)')
     parser.add_argument('--interval', type=int, default=15, help='Seconds between iterations')
     
     args = parser.parse_args()
@@ -968,7 +979,8 @@ def main():
         kalshi_key_path=kalshi_key_path,
         dry_run=not args.live,
         max_game_exposure=MAX_EXPOSURE,
-        min_edge=args.min_edge
+        min_edge=args.min_edge,
+        min_spread=args.min_spread
     )
     
     trader.run(interval=args.interval)

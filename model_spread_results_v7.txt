@@ -1,0 +1,67 @@
+DEBUG: Using spread_src/features/engineering.py
+Initializing Engines...
+Loaded NGBoost ensemble (5 models, SafeT distribution)
+Caching roster features...
+Building Team Map from DB...
+
+Fetching Active Spread Events...
+Found 10 events.
+
+Analyzing Markets vs Model...
+Game                 Mkt Width  Model CI Width  Model Pred           Rec. Spread    
+--------------------------------------------------------------------------------
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19DENLAC
+DEBUG: Found 10 markets for KXNBASPREAD-26FEB19DENLAC
+  [RosterEngine] WARNING: No player IDs provided for team 1610612746. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612743. Falling back to top 10 players.
+Prediction error for DEN@LAC: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19ORLSAC
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19ORLSAC
+  [RosterEngine] WARNING: No player IDs provided for team 1610612758. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612753. Falling back to top 10 players.
+Prediction error for ORL@SAC: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19BOSGSW
+DEBUG: Found 10 markets for KXNBASPREAD-26FEB19BOSGSW
+  [RosterEngine] WARNING: No player IDs provided for team 1610612744. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612738. Falling back to top 10 players.
+Prediction error for BOS@GSW: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19PHXSAS
+DEBUG: Found 10 markets for KXNBASPREAD-26FEB19PHXSAS
+  [RosterEngine] WARNING: No player IDs provided for team 1610612759. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612756. Falling back to top 10 players.
+Prediction error for PHX@SAS: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19TORCHI
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19TORCHI
+  [RosterEngine] WARNING: No player IDs provided for team 1610612741. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612761. Falling back to top 10 players.
+Prediction error for TOR@CHI: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19DETNYK
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19DETNYK
+  [RosterEngine] WARNING: No player IDs provided for team 1610612752. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612765. Falling back to top 10 players.
+Prediction error for DET@NYK: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19INDWAS
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19INDWAS
+  [RosterEngine] WARNING: No player IDs provided for team 1610612764. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612754. Falling back to top 10 players.
+Prediction error for IND@WAS: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19HOUCHA
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19HOUCHA
+  [RosterEngine] WARNING: No player IDs provided for team 1610612766. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612745. Falling back to top 10 players.
+Prediction error for HOU@CHA: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19BKNCLE
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19BKNCLE
+  [RosterEngine] WARNING: No player IDs provided for team 1610612739. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612751. Falling back to top 10 players.
+Prediction error for BKN@CLE: list indices must be integers or slices, not str
+DEBUG: Fetching markets for event KXNBASPREAD-26FEB19ATLPHI
+DEBUG: Found 11 markets for KXNBASPREAD-26FEB19ATLPHI
+  [RosterEngine] WARNING: No player IDs provided for team 1610612755. Falling back to top 10 players.
+  [RosterEngine] WARNING: No player IDs provided for team 1610612737. Falling back to top 10 players.
+Prediction error for ATL@PHI: list indices must be integers or slices, not str
+
+Volume Granularity Check:
+Checking if 'volume' field in market details has timestamp info...
+Sample Market Keys: ['can_close_early', 'close_time', 'created_time', 'custom_strike', 'early_close_condition', 'event_ticker', 'expected_expiration_time', 'expiration_time', 'expiration_value', 'floor_strike', 'fractional_trading_enabled', 'last_price', 'last_price_dollars', 'latest_expiration_time', 'liquidity', 'liquidity_dollars', 'market_type', 'no_ask', 'no_ask_dollars', 'no_bid', 'no_bid_dollars', 'no_sub_title', 'notional_value', 'notional_value_dollars', 'open_interest', 'open_interest_fp', 'open_time', 'previous_price', 'previous_price_dollars', 'previous_yes_ask', 'previous_yes_ask_dollars', 'previous_yes_bid', 'previous_yes_bid_dollars', 'price_level_structure', 'price_ranges', 'response_price_units', 'result', 'rules_primary', 'rules_secondary', 'settlement_timer_seconds', 'status', 'strike_type', 'subtitle', 'tick_size', 'ticker', 'title', 'updated_time', 'volume', 'volume_24h', 'volume_24h_fp', 'volume_fp', 'yes_ask', 'yes_ask_dollars', 'yes_bid', 'yes_bid_dollars', 'yes_sub_title']
+No 'volume_history' found in standard object.

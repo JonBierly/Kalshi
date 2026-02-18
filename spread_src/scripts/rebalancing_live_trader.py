@@ -47,12 +47,10 @@ class RebalancingLiveTrader:
         dry_run: bool = True,
         max_game_exposure: float = 10.0,
         max_ticker_exposure: float = 3.0,
-        min_edge: float = 0.04,
     ):
         self.dry_run = dry_run
         self.max_game_exposure = max_game_exposure
         self.max_ticker_exposure = max_ticker_exposure
-        self.min_edge = min_edge
         
         print("=" * 80)
         print("DYNAMIC REBALANCER")
@@ -60,7 +58,6 @@ class RebalancingLiveTrader:
         print(f"Mode: {'DRY-RUN (simulation)' if dry_run else 'LIVE (real money!)'}")
         print(f"Max per game: ${max_game_exposure}")
         print(f"Max per ticker: ${max_ticker_exposure}")
-        print(f"Min edge: {min_edge:.0%}")
         print("=" * 80)
         
         # Initialize components
@@ -75,12 +72,12 @@ class RebalancingLiveTrader:
             bankroll=max_game_exposure,
             kelly_fraction=0.20, 
             max_ticker_exposure=max_ticker_exposure,
-            scale_up_band=0.10,
-            derisk_band=0.20,
-            min_trade_spread=6
+            scale_up_band=0.05,
+            derisk_band=0.10,
+            min_trade_spread=0
         )
-        self.weight_history = {} # {game_id: {ticker: [w1, w2, w3]}}
         self.risk_mgr = RiskManager(max_game_exposure * 10, max_game_exposure)
+        self._cached_game_state = {}  # For dashboard export
         
         # Build event_tickers map
         self.event_tickers = {}
@@ -235,6 +232,10 @@ class RebalancingLiveTrader:
         if total_seconds < 180:
             print(f"  ⏭️  Skipping {game_id[-10:]}: Less than 3 minutes remaining")
             return []
+        
+        if total_seconds > 2460:
+            print(f"  ⏭️  Skipping {game_id[-10:]}: First 7 minutes (model not trained on this window)")
+            return []
             
         live_features = self._build_features(game, score_diff, total_seconds, period)
         
@@ -244,7 +245,7 @@ class RebalancingLiveTrader:
         trader_elapsed = time.time() - self.game_tracking_start[game_id]
         warmed_up = (trader_elapsed >= 60)
 
-        # Get prediction
+        # Get prediction once (batch inference)
         params = self.spread_model.predict_distribution_params(live_features)
         mean_diff = np.mean(params['mean'])
         std_diff = np.mean(params['std'])
@@ -258,10 +259,27 @@ class RebalancingLiveTrader:
         tickers = []
         probs = []
         prices = []
-        market_map = {} # {ticker: market}
-        ci_lower_map = {} # {ticker: ci_lower}
-        ci_upper_map = {} # {ticker: ci_upper}
-        prob_map = {} # {ticker: model_prob}
+        market_map = {}
+        ci_lower_map = {}
+        ci_upper_map = {}
+        prob_map = {}
+        
+        # Build batch distributions from cached params (avoid per-market re-inference)
+        from scipy.stats import t as t_dist
+        current_diff = live_features.get('score_diff', 0.0)
+        
+        # Collect ensemble distributions once
+        enriched_features = add_interaction_features(live_features)
+        row_data = {col: enriched_features.get(col, 0.0) for col in self.spread_model.feature_order}
+        X_live = pd.DataFrame([row_data], columns=self.spread_model.feature_order)
+        
+        ensemble_dists = []
+        for model in self.spread_model.ensemble:
+            dist = model.pred_dist(X_live.values)
+            remainder = dist.loc[0]
+            scale = dist.scale[0]
+            df = dist.df[0] if hasattr(dist, 'df') else 30.0
+            ensemble_dists.append(t_dist(df=df, loc=remainder, scale=scale))
         
         for market in spread_markets:
             try:
@@ -274,12 +292,23 @@ class RebalancingLiveTrader:
             
             is_home = (market.team == home_tri)
             threshold = market.spread
-            result = self.spread_model.predict_spread_probabilities(live_features, [threshold if is_home else -threshold])
+            adjusted_threshold = (threshold if is_home else -threshold) - current_diff
+            
+            # Compute P(hit) from cached ensemble distributions (no re-inference)
+            all_probs_for_market = []
+            for edist in ensemble_dists:
+                p = 1 - edist.cdf(adjusted_threshold)
+                all_probs_for_market.append(p)
+            
+            raw_prob = np.mean(all_probs_for_market)
+            ci_lower = np.percentile(all_probs_for_market, 10)
+            ci_upper = np.percentile(all_probs_for_market, 90)
             
             if is_home:
-                model_prob, ci_lower, ci_upper = result['probabilities'][0], result['ci_90_lower'][0], result['ci_90_upper'][0]
+                model_prob = raw_prob
             else:
-                model_prob, ci_lower, ci_upper = 1 - result['probabilities'][0], 1 - result['ci_90_upper'][0], 1 - result['ci_90_lower'][0]
+                model_prob = 1 - raw_prob
+                ci_lower, ci_upper = 1 - np.percentile(all_probs_for_market, 90), 1 - np.percentile(all_probs_for_market, 10)
             
             self.trade_logger.log_prediction(
                 game_id=game_id, ticker=market.ticker, seconds_remaining=int(total_seconds),
@@ -291,7 +320,6 @@ class RebalancingLiveTrader:
             ci_upper_map[market.ticker] = ci_upper
             prob_map[market.ticker] = model_prob
             
-            # Store fair value for display
             if not hasattr(self, '_model_fair_values'): self._model_fair_values = {}
             self._model_fair_values[market.ticker] = model_prob * 100
             
@@ -301,14 +329,7 @@ class RebalancingLiveTrader:
             prices.append(mid_price / 100.0)
             market_map[market.ticker] = market
 
-        # 1. Calculate Optimal Weights
-        # We'll use the Student-T from the first ensemble member for covariance
-        X_live = pd.DataFrame([{col: live_features.get(col, 0.0) for col in self.spread_model.feature_order}], 
-                              columns=self.spread_model.feature_order)
-        dist = self.spread_model.ensemble[0].pred_dist(X_live.values)
-        
-        # Calculate individual edges for logic (Scale Up check) and display
-        # Use mid-price for the "portfolio" solve, but individual_edges will be used for display
+        # Calculate optimal weights (no distribution param needed)
         individual_edges = {}
         for i, t in enumerate(tickers):
             individual_edges[t] = probs[i] - prices[i]
@@ -317,27 +338,22 @@ class RebalancingLiveTrader:
             tickers=tickers,
             probs=probs,
             prices=prices,
-            distribution=dist
         )
         
-        # 2. Smooth Weights (60s game-time moving average)
-        if game_id not in self.weight_history:
-            self.weight_history[game_id] = {t: [] for t in tickers}
-            
-        smoothed_weights = {}
-        for ticker in tickers:
-            hist = self.weight_history[game_id].get(ticker, [])
-            hist.append((total_seconds, raw_optimal_weights.get(ticker, 0.0)))
-            
-            # Prune entries older than 60 game-seconds
-            # total_seconds is "seconds remaining", so it decreases.
-            # Keep only entries where h[0] <= total_seconds + 60
-            hist = [h for h in hist if h[0] <= total_seconds + 60]
-            
-            self.weight_history[game_id][ticker] = hist
-            smoothed_weights[ticker] = np.mean([h[1] for h in hist])
+        # Build derisk overrides: 0% band for -EV positions (exit faster)
+        derisk_overrides = {}
+        for t in tickers:
+            pos = self.portfolio.positions.get(t, 0)
+            if pos == 0:
+                continue
+            cost = self.portfolio.cost_basis.get(t, 50.0)
+            model_fair = prob_map[t] * 100
+            if pos > 0 and model_fair < (cost - 3):  # 3¢ dead zone
+                derisk_overrides[t] = 0.0  # Any downward movement triggers exit
+            elif pos < 0 and model_fair > (cost + 3):
+                derisk_overrides[t] = 0.0
 
-        # 3. Evaluate Rebalancing
+        # Evaluate rebalancing (no smoothing — raw weights directly)
         current_weights = {}
         bids = {}
         asks = {}
@@ -348,7 +364,6 @@ class RebalancingLiveTrader:
         for t in tickers:
             pos = self.portfolio.positions.get(t, 0)
             cost = self.portfolio.cost_basis.get(t, 50.0)
-            # Weight = Exposure / Bankroll
             if pos >= 0:
                 current_weights[t] = (pos * (cost / 100.0)) / self.max_game_exposure
             else:
@@ -366,15 +381,17 @@ class RebalancingLiveTrader:
         actions = self.rebalancer.evaluate_rebalancing(
             tickers=tickers,
             current_weights=current_weights,
-            optimal_weights=smoothed_weights,
+            optimal_weights=raw_optimal_weights,
             bids=bids,
             asks=asks,
             individual_edges=individual_edges,
-            current_positions=self.portfolio.positions
+            current_positions=self.portfolio.positions,
+            derisk_overrides=derisk_overrides,
+            seconds_remaining=total_seconds,
         )
         
-        # Add metadata and print summary table
-        print(f"  {'Ticker':<12} | {'Pos':>4} | {'Bid/Ask':>9} | {'BuyE':>5} | {'SellE':>5} | {'SmoothW':>7} | {'Status'}")
+        # Print summary table
+        print(f"  {'Ticker':<12} | {'Pos':>4} | {'Bid/Ask':>9} | {'BuyE':>5} | {'SellE':>5} | {'OptW':>7} | {'Status'}")
         print(f"  {'-'*12}-+-{'-'*4}-+-{'-'*9}-+-{'-'*5}-+-{'-'*5}-+-{'-'*7}-+-{'-'*10}")
         
         for t in tickers:
@@ -387,40 +404,42 @@ class RebalancingLiveTrader:
             ask_p = asks.get(t, 100)
             spread = ask_p - bid_p
             
-            # Use execution prices [5, 95]
-            buy_price = max(5, min(95, bid_p + 1))
-            sell_price = max(5, min(95, ask_p - 1))
+            # Use actual execution prices matching urgency pricing
+            buy_price = self.rebalancer.get_execution_price('buy', bid_p, ask_p, abs(individual_edges.get(t, 0)), total_seconds, False)
+            sell_price = self.rebalancer.get_execution_price('sell', bid_p, ask_p, abs(individual_edges.get(t, 0)), total_seconds, t in derisk_overrides)
             
             buy_edge = m_prob - (buy_price / 100.0)
             sell_edge = (sell_price / 100.0) - m_prob
             
-            raw_w = raw_optimal_weights.get(t, 0.0)
-            smooth_w = smoothed_weights.get(t, 0.0)
+            opt_w = raw_optimal_weights.get(t, 0.0)
             
             # Determine Status
-            diff = smooth_w - curr_w
+            diff = opt_w - curr_w
+            ev_tag = " -EV" if t in derisk_overrides else ""
             status = "---"
             
-            # Action Mapping (must match rebalancer logic)
             if any(a.ticker == t for a in actions):
                 action = next(a for a in actions if a.ticker == t)
                 status = f"✅ {action.reason.split()[-1]}"
             else:
-                # Why was it skipped?
-                if spread < self.rebalancer.min_trade_spread:
+                # Check if black swan price filter is blocking
+                if (diff > self.rebalancer.scale_up_band and buy_price <= 5) or \
+                   (diff < -derisk_overrides.get(t, self.rebalancer.derisk_band) and (sell_price <= 5 or sell_price >= 95)):
+                    status = "🚫 PRICE"
+                elif spread < self.rebalancer.min_trade_spread:
                     if diff > self.rebalancer.scale_up_band:
-                        status = "⏳ PATIENT (S)" # Wait for spread
+                        status = "⏳ PATIENT (S)"
                     elif abs(pos) > 0 and diff < -self.rebalancer.derisk_band:
-                        status = "🤝 HOLDING (S)" # Strong hand in tight market
+                        status = "🤝 HOLDING (S)"
                     else:
                         status = "🚫 TIGHT"
                 elif diff > 0 and diff <= self.rebalancer.scale_up_band:
                     status = "💤 BAND (B)"
-                elif diff < 0 and diff >= -self.rebalancer.derisk_band:
+                elif diff < 0 and diff >= -derisk_overrides.get(t, self.rebalancer.derisk_band):
                     status = "💤 BAND (D)"
 
             bid_ask_str = f"{bid_p:02d}-{ask_p:02d}"
-            print(f"  {t[-10:]: <12} | {pos: >4} | {bid_ask_str: >9} | {buy_edge: >5.1%} | {sell_edge: >5.1%} | {smooth_w: >7.1%} | {status}")
+            print(f"  {t[-10:]: <12} | {pos: >4} | {bid_ask_str: >9} | {buy_edge: >5.1%} | {sell_edge: >5.1%} | {opt_w: >7.1%} | {status}{ev_tag}")
 
         for act in actions:
             act.warmed_up = warmed_up
@@ -430,6 +449,24 @@ class RebalancingLiveTrader:
             act.seconds_remaining = total_seconds
             act.ci_lower = ci_lower_map.get(act.ticker)
             act.ci_upper = ci_upper_map.get(act.ticker)
+        
+        # Cache state for dashboard export (avoid re-computation)
+        self._cached_game_state[game_id] = {
+            'home_score': home_score,
+            'away_score': away_score,
+            'total_seconds': total_seconds,
+            'period': period,
+            'mean_diff': mean_diff,
+            'std_diff': std_diff,
+            'live_features': live_features,
+            'ensemble_params': [
+                {'loc': d.kwds.get('loc', d.args[1] if len(d.args) > 1 else 0),
+                 'scale': d.kwds.get('scale', d.args[2] if len(d.args) > 2 else 1),
+                 'df': d.args[0] if d.args else 30.0}
+                for d in ensemble_dists
+            ],
+            'score_diff': score_diff,
+        }
             
         return actions
 
@@ -611,7 +648,7 @@ class RebalancingLiveTrader:
         print(self.order_mgr.get_order_summary())
 
     def _export_dashboard_state(self):
-        """Export current state for dashboard visualization."""
+        """Export current state for dashboard visualization using cached data."""
         import json
         
         state = {
@@ -638,40 +675,22 @@ class RebalancingLiveTrader:
             game = match['nba_game']
             game_id = game['gameId']
             
-            # Use cached prediction data if available
-            live_data = self.tracker.orch.live_client.get_live_game_data(game_id)
-            if not live_data:
+            # Use cached state from _evaluate_game_rebalancing (no re-computation)
+            cached = self._cached_game_state.get(game_id)
+            if not cached:
                 continue
-                
-            home_score = live_data['homeTeam']['score']
-            away_score = live_data['awayTeam']['score']
             
-            # Reconstruct distribution params for this game
-            # We need the most recent features
-            period = live_data.get('period', 0)
-            game_clock = live_data.get('gameClock', 'PT0M00.00S')
-            total_seconds = self._parse_time(period, game_clock)
+            home_score = cached['home_score']
+            away_score = cached['away_score']
+            total_seconds = cached['total_seconds']
+            period = cached['period']
+            live_features = cached['live_features']
+            ensemble_params = cached['ensemble_params']
             
-            # Get latest features (already computed in evaluate_game_rebalancing but not stored globally)
-            # We'll just rebuild them here for the export
-            live_features = self._build_features(game, home_score - away_score, total_seconds, period)
-            params = self.spread_model.predict_distribution_params(live_features)
-            
-            # For Student-T, we need loc, scale, and df
-            # NGBoost pred_dist returns the distribution object
-            X_live = pd.DataFrame([{col: live_features.get(col, 0.0) for col in self.spread_model.feature_order}], 
-                                  columns=self.spread_model.feature_order)
-            
-            # We'll just use the average of the ensemble for the dashboard
-            locs = []
-            scales = []
-            dfs = []
-            
-            for model in self.spread_model.ensemble:
-                dist = model.pred_dist(X_live.values)
-                locs.append(dist.loc[0])
-                scales.append(dist.scale[0])
-                dfs.append(dist.df[0] if hasattr(dist, 'df') else 30.0)
+            # Use cached ensemble params for distribution display
+            avg_loc = np.mean([p['loc'] for p in ensemble_params])
+            avg_scale = np.mean([p['scale'] for p in ensemble_params])
+            avg_df = np.mean([p['df'] for p in ensemble_params])
             
             # Categorize features for display
             driving_features = {
@@ -703,27 +722,23 @@ class RebalancingLiveTrader:
                 "seconds_remaining": total_seconds,
                 "period": period,
                 "distribution": {
-                    "loc": np.mean(locs) + (home_score - away_score),
-                    "scale": np.mean(scales),
-                    "df": np.mean(dfs)
+                    "loc": avg_loc + cached['score_diff'],
+                    "scale": avg_scale,
+                    "df": avg_df
                 },
                 "driving_features": driving_features,
                 "markets": []
             }
             
             for market in match['spread_markets']:
-                # Find matching open orders
                 market_orders = [o for o in self.order_mgr.get_open_orders() if o.ticker == market.ticker]
                 pending_buy = sum(o.size for o in market_orders if o.side == 'buy')
                 pending_sell = sum(o.size for o in market_orders if o.side == 'sell')
                 
-                # Calculate pending exposure
-                # exposure_delta expects side, price, size, current_pos
                 curr_p = self.portfolio.positions.get(market.ticker, 0)
                 pending_buy_exp = sum(self.risk_mgr.get_exposure_delta('buy', o.price, o.size, curr_p) for o in market_orders if o.side == 'buy')
                 pending_sell_exp = sum(self.risk_mgr.get_exposure_delta('sell', o.price, o.size, curr_p) for o in market_orders if o.side == 'sell')
                 
-                # Calculate position exposure
                 pos_exp = 0.0
                 if curr_p != 0:
                     cost = self.portfolio.cost_basis.get(market.ticker, 50.0)
@@ -755,7 +770,6 @@ def main():
     import argparse
     parser = argparse.ArgumentParser(description='Dynamic Rebalancer - NBA Trading Bot')
     parser.add_argument('--live', action='store_true', help='Run in live mode')
-    parser.add_argument('--min-edge', type=float, default=0.05, help='Min edge to trade')
     parser.add_argument('--interval', type=int, default=10, help='Seconds between iterations')
     args = parser.parse_args()
     
@@ -764,7 +778,7 @@ def main():
     
     trader = RebalancingLiveTrader(
         kalshi_key_id=kalshi_key_id, kalshi_key_path=kalshi_key_path,
-        dry_run=not args.live, max_game_exposure=15.0, max_ticker_exposure=5.0, min_edge=args.min_edge
+        dry_run=not args.live, max_game_exposure=15.0, max_ticker_exposure=5.0
     )
     trader.run(interval=args.interval)
 

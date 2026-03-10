@@ -985,8 +985,19 @@ def main():
     kalshi_key_id = os.environ.get("KALSHI_KEY_ID", "a40ff1c6-12ac-4a6c-9669-ffe12f3de235")
     kalshi_key_path = os.environ.get("KALSHI_KEY_PATH", "key.key")
     
-    # Balance and Risk settings
-    bal = 600  # Set to full bankroll (~$600)
+    # Dynamic Balance and Risk settings
+    kalshi_client = KalshiClient(kalshi_key_id, kalshi_key_path)
+    try:
+        current_balance = kalshi_client.get_balance().get('balance', 500)
+        # 80% of balance, rounded down to nearest hundred
+        bal = int((current_balance * 0.8) // 100) * 100
+        # Ensure at least $100 bare minimum
+        bal = max(bal, 100)
+        print(f"Kalshi Balance: ${current_balance:,.2f} | Assigned Bankroll (80% rounded down): ${bal:,.2f}")
+    except Exception as e:
+        print(f"⚠️ Failed to fetch balance: {e}. Defaulting to $500 bankroll.")
+        bal = 500
+        
     risk_rate = 0.05
     MAX_GAME_EXPOSURE = bal * risk_rate
     MAX_TICKER_EXPOSURE = MAX_GAME_EXPOSURE / 3.0  # Max 1/3 of game exposure per ticker

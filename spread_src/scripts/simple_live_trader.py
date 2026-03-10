@@ -34,7 +34,7 @@ from spread_src.models.spread_model import SpreadDistributionModel
 from spread_src.inference.spread_tracker import SpreadTracker
 from spread_src.features.engineering import add_interaction_features
 from data.kalshi import KalshiClient
-
+from spread_src.patches import apply_patch
 
 class SimpleLiveTrader:
     """
@@ -85,6 +85,12 @@ class SimpleLiveTrader:
         # Initialize components
         print("\n✓ Initializing...")
         
+        # Apply API patches to bypass NBA CDN blocks BEFORE starting other services
+        try:
+            apply_patch()
+        except Exception as e:
+            print(f"⚠️  Failed to apply NBA API patches: {e}")
+            
         self.kalshi = KalshiClient(kalshi_key_id, kalshi_key_path)
         self.portfolio = Portfolio(max_exposure=max_game_exposure * 12)  # Allow 12 games
         self.portfolio.refresh_state(self.kalshi)
@@ -152,7 +158,11 @@ class SimpleLiveTrader:
                 # Refresh state
                 self.portfolio.refresh_state(self.kalshi)
                 self.latest_market_data = {} # Reset for this iteration
-                
+
+                # Refresh real NBA game IDs (picks up games that just tipped off)
+                self.tracker.resolve_live_game_ids()
+
+
                 # Check fills
                 fills = self.order_mgr.check_for_fills()
                 for fill in fills:
@@ -329,11 +339,14 @@ class SimpleLiveTrader:
                 wait_reason = f"{wait_reason} and {trader_reason}" if wait_reason else trader_reason
             print(f"  ⏳ WARM-UP: Waiting for {wait_reason}")
         
-        # Skip First Quarter (Q1) - Analysis shows this is low-profit/high-noise
-        if period == 1 or total_seconds > 2160:
-            print(f"  ⏳ Skipping: First Quarter (Q1) analysis active")
+        # Skip first 6 minutes of the game (Q1 has 720s; 6 min elapsed = < 360s elapsed = > 2520s remaining)
+        MIN_GAME_SECONDS_ELAPSED = 360  # 6 minutes
+        Q1_TOTAL_SECONDS = 2880  # 48 min total
+        if total_seconds > (Q1_TOTAL_SECONDS - MIN_GAME_SECONDS_ELAPSED):
+            elapsed_min = (Q1_TOTAL_SECONDS - total_seconds) / 60
+            print(f"  ⏳ Skipping: only {elapsed_min:.1f} min into game (waiting for 6 min mark)")
             return []
-            
+
         # Skip late game
         if total_seconds < 120:
             print(f"  ⏰ Skipping: <2 min left")
@@ -968,17 +981,22 @@ def main():
     
     args = parser.parse_args()
     
-    # API credentials
-    kalshi_key_id = "a40ff1c6-12ac-4a6c-9669-ffe12f3de235"
-    kalshi_key_path = "key.key"
-    bal = 300
+    # API credentials (from environment or defaults for local dev)
+    kalshi_key_id = os.environ.get("KALSHI_KEY_ID", "a40ff1c6-12ac-4a6c-9669-ffe12f3de235")
+    kalshi_key_path = os.environ.get("KALSHI_KEY_PATH", "key.key")
+    
+    # Balance and Risk settings
+    bal = 600  # Set to full bankroll (~$600)
     risk_rate = 0.05
-    MAX_EXPOSURE = bal * risk_rate
+    MAX_GAME_EXPOSURE = bal * risk_rate
+    MAX_TICKER_EXPOSURE = MAX_GAME_EXPOSURE / 3.0  # Max 1/3 of game exposure per ticker
+    
     trader = SimpleLiveTrader(
         kalshi_key_id=kalshi_key_id,
         kalshi_key_path=kalshi_key_path,
         dry_run=not args.live,
-        max_game_exposure=MAX_EXPOSURE,
+        max_game_exposure=MAX_GAME_EXPOSURE,
+        max_ticker_exposure=MAX_TICKER_EXPOSURE,
         min_edge=args.min_edge,
         min_spread=args.min_spread
     )

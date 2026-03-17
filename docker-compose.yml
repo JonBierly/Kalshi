@@ -1,0 +1,13 @@
+services:
+  orchestrator:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data          # Database persists outside container
+      - ./models:/app/models      # Model files
+      - ./key.key:/app/key.key:ro # Kalshi private key (read-only)
+    restart: "no"                 # One-shot job — do not restart after exit
+    command: ["python", "-m", "spread_src.scripts.daily_orchestrator", "--live"]
+    # Timezone — ensures game times are calculated in Eastern
+    environment:
+      - TZ=America/New_York

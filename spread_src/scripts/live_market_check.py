@@ -29,7 +29,7 @@ def get_live_nba_games():
         from datetime import datetime
         today = datetime.now().strftime('%Y-%m-%d')
         
-        url = f"https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+        url = f"https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com/NBA/liveData/scoreboard/todaysScoreboard_00.json"
         response = requests.get(url, timeout=10)
         
         if response.status_code == 200:

@@ -310,8 +310,8 @@ class SimpleLiveTrader:
                     for m in spread_markets:
                         if m.ticker in price_lookup:
                             item = price_lookup[m.ticker]
-                            m.yes_bid = item.get('yes_bid', 0)
-                            m.yes_ask = item.get('yes_ask', 0)
+                            m.yes_bid = item.get('yes_bid') if item.get('yes_bid') is not None else int(float(item.get('yes_bid_dollars') or 0) * 100)
+                            m.yes_ask = item.get('yes_ask') if item.get('yes_ask') is not None else int(float(item.get('yes_ask_dollars') or 0) * 100)
             except Exception as e:
                 print(f"  ⚠️ Failed to refresh market prices: {e}")
         
@@ -474,7 +474,17 @@ class SimpleLiveTrader:
             
             # Format strings
             bid_ask_str = f"{market.yes_bid or 0}-{market.yes_ask or 0}¢"
-            model_str = f"{model_prob*100:.0f}¢ ({ci_lower*100:.0f}-{ci_upper*100:.0f})"
+            
+            if sell_edge > buy_edge and sell_edge >= 0:
+                action_str = "SELL YES"
+                # For clarity when selling, show the EV+ side (which is NO)
+                no_prob = 1 - model_prob
+                no_ci_lower = 1 - ci_upper
+                no_ci_upper = 1 - ci_lower
+                model_str = f"NO {no_prob*100:.0f}¢ ({no_ci_lower*100:.0f}-{no_ci_upper*100:.0f})"
+            else:
+                action_str = "BUY  YES"
+                model_str = f"YES {model_prob*100:.0f}¢ ({ci_lower*100:.0f}-{ci_upper*100:.0f})"
             
             # Store model fair value for position EV display
             if not hasattr(self, '_model_fair_values'):
@@ -483,11 +493,11 @@ class SimpleLiveTrader:
             
             # Edge indicator
             if best_edge >= self.trader.min_edge:
-                edge_str = f"✅ {best_edge:.1%}"
+                edge_str = f"✅ {action_str} {best_edge:.1%}"
             elif best_edge >= 0.02:
-                edge_str = f"🟡 {best_edge:.1%}"
+                edge_str = f"🟡 {action_str} {best_edge:.1%}"
             else:
-                edge_str = f"❌ {best_edge:.1%}"
+                edge_str = f"❌ {action_str} {best_edge:.1%}"
             
             print(f"  {market_name:<12} {bid_ask_str:<12} {model_str:<20} {edge_str}")
             

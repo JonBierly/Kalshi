@@ -23,8 +23,8 @@ from spread_src.execution.trade_logger import TradeLogger
 
 # Configuration
 DB_PATH = 'data/nba_data.db'
-API_KEY = "a40ff1c6-12ac-4a6c-9669-ffe12f3de235"
-KEY_PATH = "key.key"
+API_KEY = os.environ.get("KALSHI_KEY_ID", "a40ff1c6-12ac-4a6c-9669-ffe12f3de235")
+KEY_PATH = os.environ.get("KALSHI_KEY_PATH", "key.key")
 
 
 def get_settlements_pnl(kalshi):

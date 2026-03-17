@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '../.
 def get_live_nba_games():
     """Get currently live NBA games from NBA API."""
     try:
-        url = "https://cdn.nba.com/static/json/liveData/scoreboard/todaysScoreboard_00.json"
+        url = "https://nba-prod-us-east-1-mediaops-stats.s3.amazonaws.com/NBA/liveData/scoreboard/todaysScoreboard_00.json"
         response = requests.get(url, timeout=10)
         
         if response.status_code == 200:

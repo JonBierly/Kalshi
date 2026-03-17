@@ -1,0 +1,17 @@
+ngboost
+scikit-learn
+pandas
+numpy
+scipy
+nba_api
+cryptography
+sqlalchemy
+requests
+pytz
+xgboost
+joblib
+tqdm
+flask
+matplotlib
+seaborn
+shap

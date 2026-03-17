@@ -82,6 +82,68 @@ class KalshiClient:
                 print(response.text)
             return []
 
+    def get_todays_spread_events(self):
+        """
+        Discover today's NBA spread games directly from Kalshi events.
+        No NBA API needed — parses team tricodes from event ticker format.
+
+        Event ticker format: KXNBASPREAD-26FEB19ATLPHI
+          → date code = 26FEB19, away = ATL, home = PHI
+
+        Returns list of dicts: event_ticker, away_tri, home_tri, game_id (None)
+        """
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
+        ET = ZoneInfo("America/New_York")
+        now = datetime.now(ET)
+
+        # Handle post-midnight (games scheduled "yesterday" may still be live)
+        if now.hour < 2:
+            game_date = now - timedelta(days=1)
+        else:
+            game_date = now
+
+        # Kalshi date code format: 26FEB19
+        date_code = f"{str(game_date.year)[-2:]}{game_date.strftime('%b').upper()}{game_date.strftime('%d')}"
+
+        endpoint = "/events"
+        params = {
+            "series_ticker": "KXNBASPREAD",
+            "status": "open",
+            "limit": 100,
+        }
+        path = "/trade-api/v2/events"
+        headers = self._get_headers("GET", path)
+
+        try:
+            response = requests.get(f"{self.base_url}{endpoint}", headers=headers, params=params)
+            response.raise_for_status()
+            events = response.json().get('events', [])
+        except Exception as e:
+            print(f"  ⚠️ Could not fetch Kalshi spread events: {e}")
+            return []
+
+        results = []
+        for event in events:
+            ticker = event.get('event_ticker', '')
+            # Only today's events
+            if date_code not in ticker:
+                continue
+            # Parse: KXNBASPREAD-26FEB19ATLPHI → suffix = ATLPHI
+            suffix = ticker.replace(f"KXNBASPREAD-{date_code}", "")
+            if len(suffix) != 6:
+                continue  # unexpected format
+            away_tri = suffix[:3]
+            home_tri = suffix[3:]
+            results.append({
+                'event_ticker': ticker,
+                'away_tri': away_tri,
+                'home_tri': home_tri,
+            })
+
+        return results
+
+
     def get_event_markets(self, event_ticker):
         """Fetches markets for a specific event."""
         endpoint = "/markets"

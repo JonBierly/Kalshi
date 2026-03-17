@@ -298,7 +298,10 @@ class Portfolio:
             self.cost_basis[ticker] = 0.0
         
         old_basis = self.cost_basis[ticker]
-        
+
+        if size == 0:
+            return
+
         if side == 'buy':
             # Adding to long or reducing short
             if old_pos >= 0:  # Increasing long

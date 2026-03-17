@@ -83,8 +83,8 @@ class Portfolio:
         # Parse positions and calculate cost basis
         for pos_data in market_positions:
             ticker = pos_data.get('ticker')
-            position = pos_data.get('position', 0)
-            
+            position = int(float(pos_data.get('position_fp') or pos_data.get('position', 0)))
+
             if position == 0:
                 continue
                 
@@ -113,10 +113,10 @@ class Portfolio:
                 else:
                     cost_basis[ticker] = 50.0
             else:
-                # Fallback: try total_cost from position data
-                total_cost_cents = pos_data.get('total_cost', 0)
-                if total_cost_cents != 0:
-                    cost_basis[ticker] = abs(total_cost_cents) / abs(position)
+                # Fallback: derive cost basis from total_traded_dollars
+                total_traded = float(pos_data.get('total_traded_dollars', 0) or 0)
+                if total_traded != 0 and position != 0:
+                    cost_basis[ticker] = (total_traded / abs(position)) * 100
                 else:
                     cost_basis[ticker] = 50.0
         

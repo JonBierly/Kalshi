@@ -382,14 +382,17 @@ class OrderManager:
                     if order.status != 'filled':
                         order.status = 'filled'
                         order.filled_at = datetime.now()
-                        order.filled_size = fill.get('count', 0)
-                        
+                        order.filled_size = int(float(fill.get('count_fp', 0) or 0))
+
                         # Create fill object with order_id for database matching
+                        yes_price_cents = float(fill.get('yes_price_dollars', 0) or 0) * 100
+                        no_price_cents  = float(fill.get('no_price_dollars',  0) or 0) * 100
+                        fill_price = yes_price_cents if fill.get('side') == 'yes' else no_price_cents
                         fill_obj = Fill(
                             ticker=fill.get('ticker'),
                             side=fill.get('action'),  # 'buy' or 'sell'
-                            price=fill.get('yes_price', fill.get('no_price', 0)),
-                            size=fill.get('count', 0),
+                            price=fill_price,
+                            size=int(float(fill.get('count_fp', 0) or 0)),
                             order_id=order_id  # Include order_id for trade lookup
                         )
                         

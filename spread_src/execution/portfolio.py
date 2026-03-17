@@ -101,13 +101,13 @@ class Portfolio:
                 
                 for fill in ticker_fills:
                     side = fill.get('side', '').lower()
-                    price = fill.get('yes_price', 50)  # Price in cents
-                    count = fill.get('count', 0)  # Number of contracts
-                    
-                    if side in ['yes', 'no']:
+                    price = float(fill.get('yes_price_dollars', 0) or 0) * 100  # dollars → cents
+                    count = int(float(fill.get('count_fp', 0) or 0))
+
+                    if side in ['yes', 'no'] and count > 0:
                         total_cost += price * count
                         total_contracts += count
-                
+
                 if total_contracts > 0:
                     cost_basis[ticker] = total_cost / total_contracts
                 else:
@@ -225,9 +225,9 @@ class Portfolio:
                 # For now, include all settled positions
                 # TODO: filter by timestamp when API supports it
                 
-                # Kalshi provides realized_pnl in cents
-                real_pnl = pos.get('realized_pnl', 0)  # In cents
-                total_pnl += real_pnl / 100.0  # Convert to dollars
+                # Kalshi provides realized_pnl_dollars as a string in dollars
+                real_pnl = float(pos.get('realized_pnl_dollars', 0) or 0)
+                total_pnl += real_pnl
             
             return total_pnl
         except Exception as e:
@@ -653,43 +653,40 @@ class Portfolio:
             # Load each position
             for pos_data in market_positions:
                 ticker = pos_data.get('ticker')
-                position = pos_data.get('position', 0)  # Net position
-                
+                position = int(float(pos_data.get('position_fp') or pos_data.get('position', 0)))
+
                 if position == 0:
                     continue
-                
+
                 # Calculate cost basis from actual fills
                 if ticker in fills_by_ticker:
                     ticker_fills = fills_by_ticker[ticker]
-                    
+
                     # Sort by timestamp
                     ticker_fills.sort(key=lambda x: x.get('created_time', ''))
-                    
+
                     # Calculate weighted average cost
                     total_cost = 0
                     total_contracts = 0
-                    
+
                     for fill in ticker_fills:
                         side = fill.get('side', '').lower()
-                        price = fill.get('yes_price', 50)  # Price in cents
-                        count = fill.get('count', 0)  # Number of contracts
-                        
-                        if side == 'yes':  # Bought YES
+                        price = float(fill.get('yes_price_dollars', 0) or 0) * 100  # dollars → cents
+                        count = int(float(fill.get('count_fp', 0) or 0))
+
+                        if side in ['yes', 'no'] and count > 0:
                             total_cost += price * count
                             total_contracts += count
-                        elif side == 'no':  # Sold YES (short)
-                            total_cost += price * count
-                            total_contracts += count
-                    
+
                     if total_contracts > 0:
                         avg_cost = total_cost / total_contracts
                     else:
                         avg_cost = 50.0
                 else:
                     # No fill history, use position data estimate
-                    total_cost = pos_data.get('total_cost', 0)
-                    if position != 0:
-                        avg_cost = total_cost / abs(position)
+                    total_traded = float(pos_data.get('total_traded_dollars', 0) or 0)
+                    if position != 0 and total_traded != 0:
+                        avg_cost = (total_traded / abs(position)) * 100
                     else:
                         avg_cost = 50.0
                 

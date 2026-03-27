@@ -385,9 +385,11 @@ class OrderManager:
                         order.filled_size = int(float(fill.get('count_fp', 0) or 0))
 
                         # Create fill object with order_id for database matching
+                        # Always use yes_price since we always trade the YES side.
+                        # Kalshi returns side='no' on SELL YES fills (counterparty perspective),
+                        # which previously caused fill_price to be stored as 100 - actual_price.
                         yes_price_cents = float(fill.get('yes_price_dollars', 0) or 0) * 100
-                        no_price_cents  = float(fill.get('no_price_dollars',  0) or 0) * 100
-                        fill_price = yes_price_cents if fill.get('side') == 'yes' else no_price_cents
+                        fill_price = yes_price_cents
                         fill_obj = Fill(
                             ticker=fill.get('ticker'),
                             side=fill.get('action'),  # 'buy' or 'sell'

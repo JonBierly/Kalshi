@@ -339,12 +339,9 @@ class SimpleLiveTrader:
                 wait_reason = f"{wait_reason} and {trader_reason}" if wait_reason else trader_reason
             print(f"  ⏳ WARM-UP: Waiting for {wait_reason}")
         
-        # Skip first 6 minutes of the game (Q1 has 720s; 6 min elapsed = < 360s elapsed = > 2520s remaining)
-        MIN_GAME_SECONDS_ELAPSED = 360  # 6 minutes
-        Q1_TOTAL_SECONDS = 2880  # 48 min total
-        if total_seconds > (Q1_TOTAL_SECONDS - MIN_GAME_SECONDS_ELAPSED):
-            elapsed_min = (Q1_TOTAL_SECONDS - total_seconds) / 60
-            print(f"  ⏳ Skipping: only {elapsed_min:.1f} min into game (waiting for 6 min mark)")
+        # Skip Q1 entirely (>36 min remaining). Model overconfident early, edge signals unreliable.
+        if total_seconds > 2160:
+            print(f"  ⏳ Skipping: Q1 ({total_seconds/60:.1f} min left, waiting for Q2)")
             return []
 
         # Skip late game
@@ -501,6 +498,11 @@ class SimpleLiveTrader:
             
             print(f"  {market_name:<12} {bid_ask_str:<12} {model_str:<20} {edge_str}")
             
+            # Dynamic edge threshold: Q2/Q3 requires more edge than Q4
+            # Q4 = ≤720s (12 min), Q2/Q3 = 720-2160s
+            effective_min_edge = self.trader.min_edge if total_seconds <= 720 else 0.12
+            self.trader.min_edge = effective_min_edge
+
             # Get edge-based opportunities from trader (with conservative CI-based edge)
             opps = self.trader.evaluate_market(
                 ticker=market.ticker,
@@ -510,6 +512,9 @@ class SimpleLiveTrader:
                 ci_lower=ci_lower,
                 ci_upper=ci_upper
             )
+
+            # Restore base min_edge for next market
+            self.trader.min_edge = self.min_edge
             
             for opp in opps:
                 # Add game context
@@ -682,9 +687,20 @@ class SimpleLiveTrader:
                     remaining_game = self.max_game_exposure - game_exposure
                     remaining_ticker = self.max_ticker_exposure - ticker_exposure
                     bankroll = min(remaining_game, remaining_ticker)
-                    
+
                     fair_value = opp.model_prob * 100
-                    
+
+                    # Dynamic Kelly fraction by game phase — model is less reliable early
+                    # Q2 (24-36 min): 1/8 Kelly  Q3 (12-24 min): 1/6 Kelly  Q4 (<12 min): 1/4 Kelly
+                    secs = getattr(opp, 'seconds_remaining', total_seconds)
+                    if secs > 1440:
+                        phase_kelly = 0.125       # Q2: eighth-Kelly
+                    elif secs > 720:
+                        phase_kelly = 1 / 6       # Q3: sixth-Kelly
+                    else:
+                        phase_kelly = 0.25        # Q4: quarter-Kelly
+                    self.position_sizer.kelly_fraction = phase_kelly
+
                     size = self.position_sizer.calculate_size(
                         fair_value=fair_value,
                         price=opp.price,
@@ -697,6 +713,9 @@ class SimpleLiveTrader:
                         max_size=20
                     )
                     
+                    # Restore default Kelly fraction
+                    self.position_sizer.kelly_fraction = 0.25
+
                     # Clamp to individual ticker limit
                     cost_per = opp.price / 100.0
                     ticker_cap_contracts = int(remaining_ticker / cost_per)
@@ -742,6 +761,7 @@ class SimpleLiveTrader:
                         ci_lower=opp.ci_lower * 100 if opp.ci_lower else None,
                         ci_upper=opp.ci_upper * 100 if opp.ci_upper else None,
                         market_spread=opp.market_spread,
+                        position_before=current_pos,
                         seconds_remaining=getattr(opp, 'seconds_remaining', None),
                         kalshi_order_id=order_id,
                         strategy_id='simple_ev'

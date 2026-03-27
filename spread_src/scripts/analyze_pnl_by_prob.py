@@ -1,105 +1,153 @@
+"""
+P&L breakdown by model confidence bucket.
+
+For each probability bucket (50-55%, 55-60%, …) shows:
+  - Trade count
+  - Actual win rate vs model-stated probability  (calibration)
+  - Average and total realized P&L
+"""
+
 import sqlite3
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
+import argparse
 import os
 
 DB_PATH = 'data/nba_data.db'
 
-def analyze_pnl_by_prob(min_edge=2.0):
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start",    type=str, default="2026-02-09", help="Start date (YYYY-MM-DD)")
+    parser.add_argument("--end",      type=str, default=None,         help="End date (YYYY-MM-DD)")
+    parser.add_argument("--min-edge", type=float, default=2.0,        help="Min CI-based edge (cents)")
+    parser.add_argument("--output",   type=str, default="reports/pnl_by_prob.png")
+    return parser.parse_args()
+
+
+def analyze_pnl_by_prob(start_date=None, end_date=None, min_edge=2.0, output_path="reports/pnl_by_prob.png"):
     if not os.path.exists(DB_PATH):
-        print("Database not found")
-        return
+        print("Database not found"); return
 
     conn = sqlite3.connect(DB_PATH)
-    df = pd.read_sql_query("""
-        SELECT trade_id, side, fill_price, realized_pnl, size, model_fair_value 
-        FROM trades 
-        WHERE realized_pnl IS NOT NULL
-        AND size > 0
-    """, conn)
+    query = """
+        SELECT trade_id, side, fill_price, realized_pnl, size,
+               model_fair_value, model_ci_lower, model_ci_upper, created_at
+        FROM trades
+        WHERE realized_pnl IS NOT NULL AND size > 0
+    """
+    conditions, args = [], []
+    if start_date:
+        conditions.append("DATE(created_at) >= ?"); args.append(start_date)
+    if end_date:
+        conditions.append("DATE(created_at) <= ?"); args.append(end_date)
+    if conditions:
+        query += " AND " + " AND ".join(conditions)
+
+    df = pd.read_sql_query(query, conn, params=args)
     conn.close()
-    
+
     if df.empty:
-        print("No trades found")
-        return
+        print("No trades found"); return
 
-    # Calculate Edge to filter by min_edge (consistency with other reports)
-    df['edge'] = abs(df['model_fair_value'] - df['fill_price'])
-    df = df[df['edge'] >= min_edge]
-    
+    # CI-based edge
+    has_ci  = df['model_ci_lower'].notna() & df['model_ci_upper'].notna()
+    ci_edge = np.where(df['side'] == 'buy',
+                       df['model_ci_lower'] - df['fill_price'],
+                       df['fill_price'] - df['model_ci_upper'])
+    mean_edge = abs(df['model_fair_value'] - df['fill_price'])
+    df['edge'] = np.where(has_ci, ci_edge, mean_edge)
+    df = df[df['edge'] >= min_edge].copy()
+
     if df.empty:
-        print(f"No trades found with edge >= {min_edge}¢")
-        return
+        print(f"No trades with edge >= {min_edge}¢"); return
 
-    # Calculate "Bet Probability"
-    # model_fair_value is P(YES) in cents (0-100)
-    # If side is 'buy', we bet on YES. Prob = model_fair_value.
-    # If side is 'sell', we bet on NO. Prob = 100 - model_fair_value.
-    df['bet_prob'] = df.apply(
-        lambda row: row['model_fair_value'] if row['side'].lower() == 'buy' else (100 - row['model_fair_value']),
-        axis=1
-    )
+    # Bet probability & win flag
+    df['bet_prob'] = np.where(df['side'] == 'buy',
+                              df['model_fair_value'],
+                              100 - df['model_fair_value'])
+    df['win'] = (df['realized_pnl'] > 0).astype(int)
 
-    # Create probability bins
-    bins = [0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100]
-    labels = ['0-10%', '10-20%', '20-30%', '30-40%', '40-50%', '50-60%', '60-70%', '70-80%', '80-90%', '90-100%']
+    # Bucket into 5-point bins starting at 50
+    bins   = list(range(50, 105, 5))
+    labels = [f"{b}-{b+5}%" for b in bins[:-1]]
     df['prob_bin'] = pd.cut(df['bet_prob'], bins=bins, labels=labels, include_lowest=True)
 
-    # Group by probability bin AND side
-    summary_side = df.groupby(['prob_bin', 'side'], observed=True).agg({
-        'realized_pnl': ['mean', 'sum', 'count']
-    }).reset_index()
-    summary_side.columns = ['prob_bin', 'side', 'avg_pnl', 'total_pnl', 'trade_count']
+    # Per-bin summary
+    summary = df.groupby('prob_bin', observed=True).agg(
+        n          =('win', 'count'),
+        wins       =('win', 'sum'),
+        model_prob =('bet_prob', 'mean'),
+        avg_pnl    =('realized_pnl', 'mean'),
+        total_pnl  =('realized_pnl', 'sum'),
+    ).reset_index()
+    summary['actual_win_rate'] = summary['wins'] / summary['n']
+    summary['expected_win_rate'] = summary['model_prob'] / 100
+    summary['calibration_diff']  = summary['actual_win_rate'] - summary['expected_win_rate']
 
-    # Also get the global summary (all sides)
-    summary_all = df.groupby('prob_bin', observed=True).agg({
-        'realized_pnl': ['mean', 'sum', 'count']
-    }).reset_index()
-    summary_all.columns = ['prob_bin', 'avg_pnl', 'total_pnl', 'trade_count']
+    print(f"\n{'='*75}")
+    print(f"  P&L BY CONFIDENCE BUCKET  |  min_edge={min_edge}¢  |  {start_date or 'all'} →")
+    print(f"{'='*75}")
+    print(f"  {'Bucket':<11} {'N':>5} {'Model%':>8} {'Actual%':>8} {'CalDiff':>8}  "
+          f"{'AvgPnL':>8}  {'TotalPnL':>9}")
+    for _, r in summary.iterrows():
+        flag = " ←" if abs(r['calibration_diff']) > 0.07 and r['n'] >= 20 else ""
+        print(f"  {str(r['prob_bin']):<11} {r['n']:>5} "
+              f"{r['expected_win_rate']:>8.1%} {r['actual_win_rate']:>8.1%} "
+              f"{r['calibration_diff']:>+8.1%}  "
+              f"${r['avg_pnl']:>+7.3f}  ${r['total_pnl']:>+8.2f}{flag}")
 
-    print(f"\n📊 P&L Analysis by Predicted Probability and Side (Min Edge: {min_edge}¢)")
-    print(summary_side.sort_values(['prob_bin', 'side']).to_string(index=False))
+    # Plots
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    fig, axes = plt.subplots(1, 3, figsize=(20, 6))
+    fig.suptitle(
+        f"Performance by Model Confidence  |  min_edge={min_edge}¢  |  {start_date or 'all'} →",
+        fontsize=13, fontweight='bold'
+    )
 
-    # Visualization
-    fig, axes = plt.subplots(2, 1, figsize=(14, 14))
-    fig.suptitle(f'Performance vs. Model Confidence (Edge >= {min_edge}¢)', fontsize=16)
+    # 1. Calibration
+    valid = summary[summary['n'] >= 10]
+    axes[0].plot([0.5, 1.0], [0.5, 1.0], 'k--', linewidth=1, label='Perfect')
+    axes[0].scatter(valid['expected_win_rate'], valid['actual_win_rate'],
+                    s=valid['n'] * 2, color='#8e44ad', zorder=5)
+    for _, r in valid.iterrows():
+        axes[0].annotate(f"n={r['n']}", (r['expected_win_rate'], r['actual_win_rate']),
+                         textcoords='offset points', xytext=(5, 3), fontsize=7)
+    axes[0].set_xlim(0.48, 1.02); axes[0].set_ylim(0, 1.05)
+    axes[0].set_xlabel('Model probability'); axes[0].set_ylabel('Actual win rate')
+    axes[0].set_title('Calibration')
+    axes[0].legend()
 
-    # Plot 1: Avg P&L per Trade by Side
-    sns.barplot(data=summary_side, x='prob_bin', y='avg_pnl', hue='side', palette={'buy': '#3498db', 'sell': '#e67e22'}, ax=axes[0])
-    axes[0].set_title('Average P&L per Trade by Confidence & Side')
-    axes[0].set_ylabel('Avg Realized P&L ($)')
-    axes[0].axhline(0, color='black', linewidth=1.5)
-    
-    # Add counts below/above bars
-    for i, p in enumerate(axes[0].patches):
-        if p.get_height() == 0: continue
-        val = p.get_height()
-        axes[0].annotate(f"{int(val*100):+d}¢", 
-                        (p.get_x() + p.get_width() / 2., val), 
-                        ha='center', va='bottom' if val >= 0 else 'top', 
-                        xytext=(0, 5 if val >= 0 else -5), 
-                        textcoords='offset points', fontsize=8)
+    # 2. Avg P&L per trade
+    colors = ['#27ae60' if v >= 0 else '#e74c3c' for v in summary['avg_pnl']]
+    axes[1].bar(range(len(summary)), summary['avg_pnl'], color=colors)
+    axes[1].set_xticks(range(len(summary)))
+    axes[1].set_xticklabels(summary['prob_bin'].astype(str), rotation=45, ha='right', fontsize=8)
+    axes[1].axhline(0, color='black', linewidth=1)
+    axes[1].set_title('Avg P&L per Trade by Confidence')
+    axes[1].set_ylabel('Avg Realized P&L ($)')
 
-    # Plot 2: Total P&L by Side
-    sns.barplot(data=summary_side, x='prob_bin', y='total_pnl', hue='side', palette={'buy': '#3498db', 'sell': '#e67e22'}, ax=axes[1])
-    axes[1].set_title('Total Realized P&L by Confidence & Side')
-    axes[1].set_ylabel('Total P&L ($)')
-    axes[1].axhline(0, color='black', linewidth=1.5)
+    # 3. Total P&L
+    colors2 = ['#27ae60' if v >= 0 else '#e74c3c' for v in summary['total_pnl']]
+    axes[2].bar(range(len(summary)), summary['total_pnl'], color=colors2)
+    axes[2].set_xticks(range(len(summary)))
+    axes[2].set_xticklabels(summary['prob_bin'].astype(str), rotation=45, ha='right', fontsize=8)
+    axes[2].axhline(0, color='black', linewidth=1)
+    axes[2].set_title('Total P&L by Confidence')
+    axes[2].set_ylabel('Total Realized P&L ($)')
 
-    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
-    output_path = getattr(args, 'output', 'pnl_by_prob.png')
-    plt.savefig(output_path, dpi=150)
-    print(f"\n✅ Analysis plot saved to {output_path}")
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    print(f"\n✅ Saved → {output_path}")
 
-    return summary_side
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--min-edge", type=float, default=2.0, help="Min edge filter in cents")
-    parser.add_argument("--output", type=str, default="pnl_by_prob.png", help="Output filename for plot")
-    args = parser.parse_args()
-    
-    analyze_pnl_by_prob(min_edge=args.min_edge)
+    args = parse_args()
+    analyze_pnl_by_prob(
+        start_date=args.start,
+        end_date=args.end,
+        min_edge=args.min_edge,
+        output_path=args.output,
+    )

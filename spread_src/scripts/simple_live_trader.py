@@ -689,7 +689,7 @@ class SimpleLiveTrader:
 
                     # Dynamic Kelly fraction by game phase — model is less reliable early
                     # Q2 (24-36 min): 1/8 Kelly  Q3 (12-24 min): 1/6 Kelly  Q4 (<12 min): 1/4 Kelly
-                    secs = getattr(opp, 'seconds_remaining', total_seconds)
+                    secs = getattr(opp, 'seconds_remaining', 0)
                     if secs > 1440:
                         phase_kelly = 0.125       # Q2: eighth-Kelly
                     elif secs > 720:

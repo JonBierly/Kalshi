@@ -473,16 +473,12 @@ class SimpleLiveTrader:
             # Format strings
             bid_ask_str = f"{market.yes_bid or 0}-{market.yes_ask or 0}¢"
             
+            # Always show YES probability to match the bid-ask display
+            model_str = f"YES {model_prob*100:.0f}¢ ({ci_lower*100:.0f}-{ci_upper*100:.0f})"
             if sell_edge > buy_edge and sell_edge >= 0:
                 action_str = "SELL YES"
-                # For clarity when selling, show the EV+ side (which is NO)
-                no_prob = 1 - model_prob
-                no_ci_lower = 1 - ci_upper
-                no_ci_upper = 1 - ci_lower
-                model_str = f"NO {no_prob*100:.0f}¢ ({no_ci_lower*100:.0f}-{no_ci_upper*100:.0f})"
             else:
                 action_str = "BUY  YES"
-                model_str = f"YES {model_prob*100:.0f}¢ ({ci_lower*100:.0f}-{ci_upper*100:.0f})"
             
             # Store model fair value for position EV display
             if not hasattr(self, '_model_fair_values'):

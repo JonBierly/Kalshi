@@ -96,6 +96,7 @@ class SimpleLiveTrader:
         self.portfolio.refresh_state(self.kalshi)
         
         self.order_mgr = OrderManager(self.kalshi, dry_run=dry_run)
+        self.min_edge = min_edge  # base edge; used to restore after dynamic adjustment
         self.trader = SimpleEdgeTrader(min_edge=min_edge, cancel_threshold=0.02)
         self.risk_mgr = RiskManager(max_game_exposure * 12, max_game_exposure)
         self.position_sizer = PositionSizer(kelly_fraction=0.25)  # Quarter-Kelly
